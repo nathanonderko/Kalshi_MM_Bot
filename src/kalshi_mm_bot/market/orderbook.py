@@ -40,26 +40,8 @@ class Orderbook:
         asks_raw: Iterable[Sequence[str]],
         price_ranges: tuple[PriceRange, ...],
     ) -> "Orderbook":
-        bids = [0] * (ONE_DOLLAR + 1)
-        asks = [0] * (ONE_DOLLAR + 1)
-        best_bid: int | None = None
-        best_ask: int | None = None
-
-        for price_text, size_text in bids_raw:
-            price = parse_price_fp(price_text)
-            size = parse_count_fp(size_text)
-            bids[price] = size
-
-            if size > 0 and (best_bid is None or price > best_bid):
-                best_bid = price
-
-        for price_text, size_text in asks_raw:
-            price = parse_price_fp(price_text)
-            size = parse_count_fp(size_text)
-            asks[price] = size
-
-            if size > 0 and (best_ask is None or price < best_ask):
-                best_ask = price
+        bids, best_bid = _load_snapshot_side(bids_raw, prefer_highest=True)
+        asks, best_ask = _load_snapshot_side(asks_raw, prefer_highest=False)
 
         return cls(
             market_ticker=market_ticker,
@@ -137,6 +119,32 @@ class Orderbook:
             index += 1
 
         return None
+
+
+def _load_snapshot_side(
+    raw_levels: Iterable[Sequence[str]],
+    *,
+    prefer_highest: bool,
+) -> tuple[list[int], int | None]:
+    levels = [0] * (ONE_DOLLAR + 1)
+    best_price: int | None = None
+
+    for price_text, size_text in raw_levels:
+        price = parse_price_fp(price_text)
+        size = parse_count_fp(size_text)
+        levels[price] = size
+
+        if size <= 0:
+            continue
+
+        if best_price is None:
+            best_price = price
+        elif prefer_highest and price > best_price:
+            best_price = price
+        elif not prefer_highest and price < best_price:
+            best_price = price
+
+    return levels, best_price
 
 
 @cache

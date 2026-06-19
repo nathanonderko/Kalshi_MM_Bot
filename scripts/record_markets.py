@@ -45,37 +45,40 @@ async def _run(args: argparse.Namespace) -> None:
     output_dir = args.output or _default_output_dir()
 
     settings = load_settings()
-    private_key_path = _resolve_private_key_path(settings.private_key_path)
-    auth = KalshiAuth(settings.api_key_id, private_key_path)
-    rest_url = settings.prod_rest_base_url if args.prod else settings.demo_rest_base_url
-    ws_url = settings.prod_ws_url if args.prod else settings.demo_ws_url
-    environment = "production" if args.prod else "demo"
+    environment = settings.environment(prod=args.prod)
+    auth = KalshiAuth(settings.api_key_id, settings.private_key_path)
 
     writer = RecordingSessionWriter.create(
         output_dir,
         compress_events=args.compress,
         flush_every=args.flush_every,
     )
-    rest = KalshiRestClient(rest_url, auth)
-    ws = RecordingWebSocketClient(KalshiWebSocketClient(ws_url, auth), writer)
+    rest = KalshiRestClient(environment.rest_base_url, auth)
+    ws = RecordingWebSocketClient(
+        KalshiWebSocketClient(environment.ws_url, auth),
+        writer,
+    )
     controller = FeedController(rest=rest, ws=ws)
     receiver: asyncio.Task[None] | None = None
 
     try:
-        print(f"Connecting to {environment}...")
+        print(f"Connecting to {environment.name}...")
         await controller.connect()
         print(f"Subscribing to {len(tickers)} market(s): {', '.join(tickers)}")
         await controller.subscribe(tickers, channels=channels)
 
         writer.write_manifest(
             RecordingManifest.create(
-                environment=environment,
+                environment=environment.name,
                 tickers=tickers,
                 channels=channels,
                 price_ranges_by_ticker=controller.price_ranges_by_ticker,
                 event_file=writer.event_path.name,
                 started_at_utc=writer.started_at_utc,
-                metadata={"rest_base_url": rest_url, "ws_url": ws_url},
+                metadata={
+                    "rest_base_url": environment.rest_base_url,
+                    "ws_url": environment.ws_url,
+                },
             )
         )
 
@@ -85,7 +88,7 @@ async def _run(args: argparse.Namespace) -> None:
     except InvalidStatus as error:
         if getattr(error.response, "status_code", None) == 401:
             raise RuntimeError(
-                f"Kalshi rejected websocket auth for {environment} (HTTP 401). "
+                f"Kalshi rejected websocket auth for {environment.name} (HTTP 401). "
                 "Use production keys with --prod, or demo keys with --demo."
             ) from error
 
@@ -108,23 +111,10 @@ async def _wait_for_stop(receiver: asyncio.Task[None], duration_sec: float | Non
         await receiver
         return
 
-    timer = asyncio.create_task(asyncio.sleep(duration_sec))
-
     try:
-        done, pending = await asyncio.wait(
-            {receiver, timer},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if receiver in done:
-            await receiver
-
-        for task in pending:
-            task.cancel()
-    finally:
-        timer.cancel()
-        with suppress(asyncio.CancelledError):
-            await timer
+        await asyncio.wait_for(asyncio.shield(receiver), timeout=duration_sec)
+    except asyncio.TimeoutError:
+        return
 
 
 def _parse_args() -> argparse.Namespace:
@@ -214,19 +204,6 @@ def _ticker_tuple(raw_tickers: list[str], parser: argparse.ArgumentParser) -> tu
         parser.error("provide at least one market ticker")
 
     return ticker_tuple
-
-
-def _resolve_private_key_path(path: Path) -> Path:
-    resolved = path if path.is_absolute() else ROOT / path
-
-    if not resolved.exists():
-        raise FileNotFoundError(
-            f"Kalshi private key not found: {resolved}. "
-            "Set KALSHI_PRIVATE_KEY_PATH in .env to an absolute path, or a path relative "
-            "to the project root."
-        )
-
-    return resolved
 
 
 def _default_output_dir() -> Path:

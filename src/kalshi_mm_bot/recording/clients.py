@@ -75,6 +75,7 @@ class RecordedWebSocketClient:
         self.speed_multiplier = speed_multiplier
         self.sent: list[dict[str, Any]] = []
         self.returned_count = 0
+        self.last_event: RecordedEvent | None = None
 
         self._events: Iterator[RecordedEvent] | None = None
         self._connected = False
@@ -97,12 +98,14 @@ class RecordedWebSocketClient:
         self._connected = True
         self._replay_start_monotonic = None
         self.returned_count = 0
+        self.last_event = None
         self.sent.clear()
 
     async def close(self) -> None:
         self._events = None
         self._connected = False
         self._replay_start_monotonic = None
+        self.last_event = None
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self._require_connected()
@@ -120,6 +123,7 @@ class RecordedWebSocketClient:
 
         await self._sleep_until(event)
         self.returned_count += 1
+        self.last_event = event
         return deepcopy(event.msg)
 
     async def _sleep_until(self, event: RecordedEvent) -> None:

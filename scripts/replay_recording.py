@@ -12,16 +12,25 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kalshi_mm_bot.api.feed_controller import FeedController, ORDERBOOK_CHANNEL
-from kalshi_mm_bot.market.orderbook import Orderbook
-from kalshi_mm_bot.market.price import format_count_fp, format_price_fp
+from kalshi_mm_bot.market.price import format_price_fp, parse_count_fp
+from kalshi_mm_bot.market.view import TopOfBookRow, top_of_book_rows
 from kalshi_mm_bot.recording import (
     RecordedRestClient,
     RecordedWebSocketClient,
     RecordingSessionReader,
 )
+from kalshi_mm_bot.sim import (
+    BacktestSummary,
+    BacktestUpdate,
+    fill_model_from_name,
+    format_contract_count,
+    format_money_value,
+    run_replay_backtest,
+)
+from kalshi_mm_bot.strategy import DumbMarketMakerStrategy
 
 
-Row = tuple[str, str, str, str, str]
+Row = TopOfBookRow
 
 
 def main() -> None:
@@ -30,6 +39,10 @@ def main() -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    if args.simulate:
+        await _run_simulation(args)
+        return
+
     reader = RecordingSessionReader.open(args.recording)
     ws = RecordedWebSocketClient.from_session(reader, speed_multiplier=args.speed)
     rest = RecordedRestClient(reader.manifest)
@@ -65,7 +78,7 @@ async def _run(args: argparse.Namespace) -> None:
                     updated_ticker=updated_ticker,
                 )
 
-        rows = _snapshot_rows(controller, reader.manifest.tickers)
+        rows = top_of_book_rows(controller.orderbooks, reader.manifest.tickers)
 
         if watcher is not None:
             watcher.render(
@@ -93,16 +106,57 @@ async def _run(args: argparse.Namespace) -> None:
         print(",".join(row))
 
 
-def _snapshot_rows(controller: FeedController, tickers: tuple[str, ...]) -> tuple[Row, ...]:
-    rows: list[Row] = []
+async def _run_simulation(args: argparse.Namespace) -> None:
+    strategy = DumbMarketMakerStrategy(
+        count=parse_count_fp(args.order_size),
+        max_position=parse_count_fp(args.max_position),
+    )
+    fill_model = fill_model_from_name(args.fill_model)
+    watcher = TerminalBacktestWatcher() if args.watch else None
 
-    for ticker in tickers:
-        book = controller.orderbooks.get(ticker)
-        bid_price, bid_size = _best_level(book, "bid")
-        ask_price, ask_size = _best_level(book, "ask")
-        rows.append((ticker, bid_price, bid_size, ask_price, ask_size))
+    result = await run_replay_backtest(
+        args.recording,
+        strategy=strategy,
+        fill_model=fill_model,
+        speed_multiplier=args.speed,
+        latency_seconds=args.latency_sec,
+        on_update=watcher.render if watcher is not None else None,
+        update_interval_seconds=args.watch_interval,
+    )
 
-    return tuple(rows)
+    if watcher is not None:
+        print("")
+
+    print(f"Simulated {result.summary.event_count} event(s) from {result.recording}")
+    print("")
+    print(_format_summary(result.summary))
+
+    if result.final_rows:
+        print("")
+        print("Ticker,Best Bid,Bid Size,Best Ask,Ask Size")
+        for row in result.final_rows:
+            print(",".join(row))
+
+    if args.print_fills and result.fills:
+        print("")
+        print("Fill ID,Time,Order ID,Ticker,Action,Side,Price,Count,Model,Reason")
+        for fill in result.fills:
+            print(
+                ",".join(
+                    (
+                        fill.fill_id,
+                        "" if fill.observed_at_utc is None else fill.observed_at_utc,
+                        fill.order_id,
+                        fill.market_ticker,
+                        fill.action,
+                        fill.side,
+                        format_price_fp(fill.yes_price),
+                        format_contract_count(fill.count),
+                        fill.fill_model,
+                        fill.reason,
+                    )
+                )
+            )
 
 
 class TerminalBookWatcher:
@@ -138,7 +192,7 @@ class TerminalBookWatcher:
         final: bool = False,
     ) -> None:
         self._last_render = time.monotonic()
-        rows = _snapshot_rows(controller, self.tickers)
+        rows = top_of_book_rows(controller.orderbooks, self.tickers)
         text = _format_watch_table(
             rows,
             event_count=event_count,
@@ -148,6 +202,75 @@ class TerminalBookWatcher:
         prefix = "\x1b[2J\x1b[H" if sys.stdout.isatty() else ""
 
         print(prefix + text, end="", flush=True)
+
+
+class TerminalBacktestWatcher:
+    def render(self, update: BacktestUpdate) -> None:
+        text = _format_backtest_watch(update)
+        prefix = "\x1b[2J\x1b[H" if sys.stdout.isatty() else ""
+        print(prefix + text, end="", flush=True)
+
+
+def _format_backtest_watch(update: BacktestUpdate) -> str:
+    status = "FINAL" if update.final else "LIVE"
+    summary = update.summary
+    header = (
+        f"Backtest watch: {status} | events={summary.event_count} | "
+        f"fills={summary.fill_count} | updated={update.updated_ticker or '-'}"
+    )
+    lines = [header, ""]
+    lines.extend(_summary_lines(summary))
+
+    if update.rows:
+        lines.append("")
+        table_rows = [("Ticker", "Best Bid", "Bid Size", "Best Ask", "Ask Size"), *update.rows]
+        widths = [
+            max(len(row[column]) for row in table_rows)
+            for column in range(len(table_rows[0]))
+        ]
+        lines.append(_format_table_row(table_rows[0], widths))
+        lines.append("  ".join("-" * width for width in widths))
+
+        for row in update.rows:
+            lines.append(_format_table_row(row, widths))
+
+    if update.recent_fills:
+        lines.append("")
+        lines.append("Recent fills:")
+
+        for fill in update.recent_fills[-5:]:
+            lines.append(
+                "  "
+                f"{fill.action} {format_contract_count(fill.count)} "
+                f"{fill.market_ticker} @ {format_price_fp(fill.yes_price)} "
+                f"({fill.reason})"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _format_summary(summary: BacktestSummary) -> str:
+    return "\n".join(_summary_lines(summary))
+
+
+def _summary_lines(summary: BacktestSummary) -> list[str]:
+    rows = (
+        ("Strategy", summary.strategy_name),
+        ("Fill model", summary.fill_model),
+        ("Events", str(summary.event_count)),
+        ("Orders", str(summary.order_count)),
+        ("Open orders", str(summary.open_order_count)),
+        ("Fills", str(summary.fill_count)),
+        ("Buy filled", format_contract_count(summary.buy_filled_count)),
+        ("Sell filled", format_contract_count(summary.sell_filled_count)),
+        ("Position", format_contract_count(summary.position_count)),
+        ("Volume", format_contract_count(summary.volume_count)),
+        ("Cash", format_money_value(summary.cash_value)),
+        ("Mark to market", format_money_value(summary.mark_to_market_value)),
+    )
+    width = max(len(label) for label, _ in rows)
+    return [f"{label.ljust(width)}  {value}" for label, value in rows]
 
 
 def _format_watch_table(
@@ -183,23 +306,6 @@ def _format_table_row(row: tuple[str, ...], widths: list[int]) -> str:
         value.ljust(widths[index]) if index == 0 else value.rjust(widths[index])
         for index, value in enumerate(row)
     )
-
-
-def _best_level(book: Orderbook | None, side: str) -> tuple[str, str]:
-    if book is None:
-        return "-", "-"
-
-    if side == "bid":
-        price = book.best_bid
-        levels = book.bids
-    else:
-        price = book.best_ask
-        levels = book.asks
-
-    if price is None:
-        return "-", "-"
-
-    return format_price_fp(price), format_count_fp(levels[price])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -238,6 +344,38 @@ def _parse_args() -> argparse.Namespace:
         default=0.25,
         help="Minimum seconds between watch table refreshes. Default: 0.25.",
     )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Run the dumb market-maker simulation while replaying.",
+    )
+    parser.add_argument(
+        "--fill-model",
+        choices=("optimistic", "pessimistic", "queue"),
+        default="queue",
+        help="Fill model used with --simulate. Default: queue.",
+    )
+    parser.add_argument(
+        "--order-size",
+        default="1.00",
+        help="Contracts per quote for --simulate. Default: 1.00.",
+    )
+    parser.add_argument(
+        "--max-position",
+        default="10.00",
+        help="Absolute YES inventory cap for --simulate. Default: 10.00.",
+    )
+    parser.add_argument(
+        "--latency-sec",
+        type=float,
+        default=0.0,
+        help="Simulated open/cancel latency in seconds. Default: 0.",
+    )
+    parser.add_argument(
+        "--print-fills",
+        action="store_true",
+        help="Print simulated fills as CSV after --simulate completes.",
+    )
     args = parser.parse_args()
 
     if args.speed is not None and args.speed < 0:
@@ -245,6 +383,18 @@ def _parse_args() -> argparse.Namespace:
 
     if args.watch_interval <= 0:
         parser.error("--watch-interval must be greater than zero")
+
+    if args.latency_sec < 0:
+        parser.error("--latency-sec must be non-negative")
+
+    try:
+        if parse_count_fp(args.order_size) <= 0:
+            parser.error("--order-size must be greater than zero")
+
+        if parse_count_fp(args.max_position) < 0:
+            parser.error("--max-position must be non-negative")
+    except ValueError as error:
+        parser.error(str(error))
 
     args.speed = _speed_multiplier(args)
     args.recording = _recording_path(args.recording, parser)

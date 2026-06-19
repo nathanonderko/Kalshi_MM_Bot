@@ -132,7 +132,7 @@ class FeedController:
 
         self._receiver_running = True
 
-        try:   # why is this in a try statement?
+        try:
             while True:
                 await self._recv_and_dispatch()
         finally:
@@ -262,34 +262,43 @@ class FeedController:
 
         try:
             await self.ws.send_json(payload)
-
-            if self._receiver_running:
-                raw_msg = await wait_for(waiter, timeout=self.command_timeout)
-            else:
-                deadline = loop.time() + self.command_timeout
-
-                while not waiter.done():
-                    remaining = deadline - loop.time()
-
-                    if remaining <= 0:
-                        raise FeedControllerError(f"timed out waiting for command {command_id}")
-
-                    try:
-                        await self._recv_and_dispatch(timeout=remaining)
-                    except TimeoutError as error:
-                        raise FeedControllerError(
-                            f"timed out waiting for command {command_id}"
-                        ) from error
-
-                raw_msg = waiter.result()
-
-        except TimeoutError as error:
-            raise FeedControllerError(f"timed out waiting for command {command_id}") from error
+            raw_msg = await self._wait_for_command(command_id, waiter)
         finally:
             self._command_waiters.pop(command_id, None)
 
         if raw_msg.get("type") == "error":
             raise FeedControllerError(f"Kalshi WS error: {raw_msg.get('msg')}")
+
+    async def _wait_for_command(
+        self,
+        command_id: int,
+        waiter: Future[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self._receiver_running:
+            try:
+                return await wait_for(waiter, timeout=self.command_timeout)
+            except TimeoutError as error:
+                raise FeedControllerError(
+                    f"timed out waiting for command {command_id}"
+                ) from error
+
+        loop = get_running_loop()
+        deadline = loop.time() + self.command_timeout
+
+        while not waiter.done():
+            remaining = deadline - loop.time()
+
+            if remaining <= 0:
+                raise FeedControllerError(f"timed out waiting for command {command_id}")
+
+            try:
+                await self._recv_and_dispatch(timeout=remaining)
+            except TimeoutError as error:
+                raise FeedControllerError(
+                    f"timed out waiting for command {command_id}"
+                ) from error
+
+        return waiter.result()
 
     async def _recv_and_dispatch(self, timeout: float | None = None) -> str | None:
         if timeout is None:

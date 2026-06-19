@@ -30,39 +30,44 @@ _COUNT_FRAC_MULTIPLIERS = (COUNT_SCALE, 10, 1)
 
 
 def parse_price_fp(value: str) -> int:
-    dot_index = value.find(".")
-
-    if dot_index < 0:
-        return int(value) * PRICE_SCALE
-
-    frac_len = len(value) - dot_index - 1
-
-    if frac_len > PRICE_DECIMALS:
-        raise ValueError(f"too many price decimals: {value!r}")
-
-    if frac_len == PRICE_DECIMALS:
-        return int(value.replace(".", ""))
-
-    sign = -1 if value[0] == "-" else 1
-    start = 1 if sign < 0 else 0
-    whole = int(value[start:dot_index]) if dot_index > start else 0
-    frac = int(value[dot_index + 1:]) if frac_len else 0
-
-    return sign * (whole * PRICE_SCALE + frac * _PRICE_FRAC_MULTIPLIERS[frac_len])
+    return _parse_fixed_point(
+        value=value,
+        scale=PRICE_SCALE,
+        decimals=PRICE_DECIMALS,
+        frac_multipliers=_PRICE_FRAC_MULTIPLIERS,
+        label="price",
+    )
 
 
 def parse_count_fp(value: str) -> int:
+    return _parse_fixed_point(
+        value=value,
+        scale=COUNT_SCALE,
+        decimals=COUNT_DECIMALS,
+        frac_multipliers=_COUNT_FRAC_MULTIPLIERS,
+        label="count",
+    )
+
+
+def _parse_fixed_point(
+    *,
+    value: str,
+    scale: int,
+    decimals: int,
+    frac_multipliers: tuple[int, ...],
+    label: str,
+) -> int:
     dot_index = value.find(".")
 
     if dot_index < 0:
-        return int(value) * COUNT_SCALE
+        return int(value) * scale
 
     frac_len = len(value) - dot_index - 1
 
-    if frac_len > COUNT_DECIMALS:
-        raise ValueError(f"too many count decimals: {value!r}")
+    if frac_len > decimals:
+        raise ValueError(f"too many {label} decimals: {value!r}")
 
-    if frac_len == COUNT_DECIMALS:
+    if frac_len == decimals:
         return int(value.replace(".", ""))
 
     sign = -1 if value[0] == "-" else 1
@@ -70,7 +75,7 @@ def parse_count_fp(value: str) -> int:
     whole = int(value[start:dot_index]) if dot_index > start else 0
     frac = int(value[dot_index + 1:]) if frac_len else 0
 
-    return sign * (whole * COUNT_SCALE + frac * _COUNT_FRAC_MULTIPLIERS[frac_len])
+    return sign * (whole * scale + frac * frac_multipliers[frac_len])
 
 
 def format_price_fp(price: int) -> str:
