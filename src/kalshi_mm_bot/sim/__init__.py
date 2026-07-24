@@ -20,6 +20,11 @@ from kalshi_mm_bot.sim.fills import (
     fill_model_from_name,
 )
 from kalshi_mm_bot.sim.orders import SimulatedOrder
+from kalshi_mm_bot.sim.reporting import (
+    backtest_summary_lines,
+    backtest_summary_rows,
+    format_backtest_summary,
+)
 
 __all__ = [
     "BacktestResult",
@@ -34,7 +39,10 @@ __all__ = [
     "SimulatedFill",
     "SimulatedOrder",
     "SimulatedOrderManager",
+    "backtest_summary_lines",
+    "backtest_summary_rows",
     "fill_model_from_name",
+    "format_backtest_summary",
     "format_contract_count",
     "format_money_value",
     "run_replay_backtest",

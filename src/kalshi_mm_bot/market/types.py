@@ -37,3 +37,17 @@ class MarketPosition:
     realized_pnl: int
     fees_paid: int
     volume: int
+
+
+def outcome_side_to_book_side(side: str) -> BookSide:
+    if side == "yes":
+        return "bid"
+
+    if side == "no":
+        return "ask"
+
+    raise ValueError(f"unknown outcome side: {side!r}")
+
+
+def book_side_to_outcome_side(side: BookSide) -> OutcomeSide:
+    return "yes" if side == "bid" else "no"

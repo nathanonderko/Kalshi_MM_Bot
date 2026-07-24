@@ -6,7 +6,14 @@ from typing import Protocol
 
 from kalshi_mm_bot.market.orderbook import Orderbook
 from kalshi_mm_bot.market.price import parse_count_fp, parse_price_fp
-from kalshi_mm_bot.market.types import BookSide, MarketTicker, OrderAction, OrderId, OutcomeSide
+from kalshi_mm_bot.market.types import (
+    BookSide,
+    MarketTicker,
+    OrderAction,
+    OrderId,
+    OutcomeSide,
+    outcome_side_to_book_side,
+)
 from kalshi_mm_bot.sim.orders import SimulatedOrder
 from kalshi_mm_bot.strategy.types import StrategyContext
 
@@ -225,18 +232,9 @@ def parse_orderbook_delta(raw_msg: dict) -> OrderbookDelta | None:
         return None
 
     data = raw_msg["msg"]
-    side = data["side"]
-
-    if side == "yes":
-        book_side: BookSide = "bid"
-    elif side == "no":
-        book_side = "ask"
-    else:
-        raise ValueError(f"unknown orderbook side: {side!r}")
-
     return OrderbookDelta(
         market_ticker=data["market_ticker"],
-        book_side=book_side,
+        book_side=outcome_side_to_book_side(data["side"]),
         yes_price=parse_price_fp(data["price_dollars"]),
         delta_count=parse_count_fp(data["delta_fp"]),
     )

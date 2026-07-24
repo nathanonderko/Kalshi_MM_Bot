@@ -1,0 +1,30 @@
+from __future__ import annotations
+
+from kalshi_mm_bot.strategy.adaptive import AdaptivePredictionMarketMakerStrategy
+from kalshi_mm_bot.strategy.dumb import DumbMarketMakerStrategy
+from kalshi_mm_bot.strategy.types import Strategy
+
+STRATEGY_NAMES: tuple[str, ...] = ("adaptive", "dumb")
+
+
+def strategy_from_name(
+    name: str,
+    *,
+    count: int,
+    max_position: int,
+) -> Strategy:
+    normalized = name.strip().lower()
+
+    if normalized in {"adaptive", "prediction", "adaptive_prediction_mm"}:
+        return AdaptivePredictionMarketMakerStrategy(
+            count=count,
+            max_position=max_position,
+        )
+
+    if normalized in {"dumb", "benchmark", "dumb_join_top"}:
+        return DumbMarketMakerStrategy(
+            count=count,
+            max_position=max_position,
+        )
+
+    raise ValueError(f"unknown strategy: {name!r}")

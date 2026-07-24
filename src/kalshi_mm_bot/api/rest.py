@@ -6,7 +6,7 @@ import httpx
 from kalshi_mm_bot.api.auth import KalshiAuth
 from kalshi_mm_bot.api.parser import parse_price_ranges
 from kalshi_mm_bot.market.price import format_count_fp, format_price_fp
-from kalshi_mm_bot.market.types import BookSide, PriceRange
+from kalshi_mm_bot.market.types import BookSide, PriceRange, book_side_to_outcome_side
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +168,7 @@ def _order_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ticker": ticker,
-        "side": "yes" if side == "bid" else "no",
+        "side": book_side_to_outcome_side(side),
         "count_fp": format_count_fp(count),
         "yes_price_dollars": format_price_fp(price),
         "action": "buy",
