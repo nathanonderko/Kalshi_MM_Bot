@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import re
 import sys
 from contextlib import suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -26,8 +24,10 @@ from kalshi_mm_bot.api.feed_controller import (
 from kalshi_mm_bot.api.rest import KalshiRestClient
 from kalshi_mm_bot.api.websocket import KalshiWebSocketClient
 from kalshi_mm_bot.config import load_settings
+from kalshi_mm_bot.market.tickers import parse_ticker_tuple
 from kalshi_mm_bot.recording import RecordingManifest, RecordingSessionWriter
 from kalshi_mm_bot.recording.clients import RecordingWebSocketClient
+from kalshi_mm_bot.recording.paths import default_recording_dir
 
 
 def main() -> None:
@@ -42,7 +42,7 @@ def main() -> None:
 async def _run(args: argparse.Namespace) -> None:
     tickers = args.tickers
     channels = cast(tuple[FeedChannel, ...], tuple(dict.fromkeys(args.channels)))
-    output_dir = args.output or _default_output_dir()
+    output_dir = args.output or default_recording_dir(ROOT)
 
     settings = load_settings()
     environment = settings.environment(prod=args.prod)
@@ -189,27 +189,11 @@ def _ticker_tuple(raw_tickers: list[str], parser: argparse.ArgumentParser) -> tu
 
         raw_tickers = [raw_text]
 
-    tickers: list[str] = []
-
-    for raw_ticker in raw_tickers:
-        tickers.extend(
-            ticker.upper()
-            for ticker in re.split(r"[\s,]+", raw_ticker.strip())
-            if ticker
-        )
-
-    ticker_tuple = tuple(dict.fromkeys(tickers))
+    ticker_tuple = parse_ticker_tuple(raw_tickers)
 
     if not ticker_tuple:
         parser.error("provide at least one market ticker")
 
     return ticker_tuple
-
-
-def _default_output_dir() -> Path:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return ROOT / "recordings" / timestamp
-
-
 if __name__ == "__main__":
     main()

@@ -25,16 +25,11 @@ COUNT_SCALE = 100
 
 ONE_DOLLAR = PRICE_SCALE
 
-_PRICE_FRAC_MULTIPLIERS = (PRICE_SCALE, 1_000, 100, 10, 1)
-_COUNT_FRAC_MULTIPLIERS = (COUNT_SCALE, 10, 1)
-
-
 def parse_price_fp(value: str) -> int:
     return _parse_fixed_point(
         value=value,
         scale=PRICE_SCALE,
         decimals=PRICE_DECIMALS,
-        frac_multipliers=_PRICE_FRAC_MULTIPLIERS,
         label="price",
     )
 
@@ -44,7 +39,6 @@ def parse_count_fp(value: str) -> int:
         value=value,
         scale=COUNT_SCALE,
         decimals=COUNT_DECIMALS,
-        frac_multipliers=_COUNT_FRAC_MULTIPLIERS,
         label="count",
     )
 
@@ -54,28 +48,30 @@ def _parse_fixed_point(
     value: str,
     scale: int,
     decimals: int,
-    frac_multipliers: tuple[int, ...],
     label: str,
 ) -> int:
-    dot_index = value.find(".")
+    value = value.strip()
 
-    if dot_index < 0:
+    if not value:
+        raise ValueError(f"empty {label}")
+
+    if "." not in value:
         return int(value) * scale
 
-    frac_len = len(value) - dot_index - 1
+    sign = -1 if value.startswith("-") else 1
+    unsigned = value[1:] if sign < 0 else value
+    whole_text, _, frac_text = unsigned.partition(".")
 
-    if frac_len > decimals:
+    if "." in frac_text:
+        raise ValueError(f"invalid {label}: {value!r}")
+
+    if len(frac_text) > decimals:
         raise ValueError(f"too many {label} decimals: {value!r}")
 
-    if frac_len == decimals:
-        return int(value.replace(".", ""))
+    whole = int(whole_text) if whole_text else 0
+    frac = int(frac_text.ljust(decimals, "0")) if frac_text else 0
 
-    sign = -1 if value[0] == "-" else 1
-    start = 1 if sign < 0 else 0
-    whole = int(value[start:dot_index]) if dot_index > start else 0
-    frac = int(value[dot_index + 1:]) if frac_len else 0
-
-    return sign * (whole * scale + frac * frac_multipliers[frac_len])
+    return sign * (whole * scale + frac)
 
 
 def format_price_fp(price: int) -> str:

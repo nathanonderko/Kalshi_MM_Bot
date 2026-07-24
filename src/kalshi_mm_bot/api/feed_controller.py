@@ -8,7 +8,7 @@ from kalshi_mm_bot.api.rest import KalshiRestClient
 from kalshi_mm_bot.api.websocket import KalshiWebSocketClient
 from kalshi_mm_bot.market.orderbook import Orderbook, SequenceGapError
 from kalshi_mm_bot.market.price import parse_count_fp, parse_price_fp
-from kalshi_mm_bot.market.types import BookSide, PriceRange
+from kalshi_mm_bot.market.types import PriceRange, outcome_side_to_book_side
 
 FeedChannel = Literal["orderbook_delta", "fill", "market_positions"]
 SubscriptionAction = Literal["add_markets", "delete_markets"]
@@ -114,14 +114,7 @@ class FeedController:
         channels: Iterable[FeedChannel] = FEED_CHANNELS,
     ) -> None:
         for channel in _channel_tuple(channels):
-            sid = self._sids.get(channel)
-
-            if sid is None:
-                continue
-
-            await self._run_command("unsubscribe", {"sids": [sid]})
-            if self._sids.get(channel) == sid:
-                self._clear_channel(channel)
+            await self._unsubscribe_channel(channel)
 
     async def recv(self) -> str | None:
         return await self._recv_and_dispatch()
@@ -212,9 +205,7 @@ class FeedController:
             raise FeedControllerError(f"missing sid for channel {channel!r}")
 
         if len(removed_tickers) == len(current):
-            await self._run_command("unsubscribe", {"sids": [sid]})
-            if self._sids.get(channel) == sid:
-                self._clear_channel(channel)
+            await self._unsubscribe_channel(channel)
             return
 
         await self._update_subscription(sid, removed_tickers, "delete_markets")
@@ -383,11 +374,22 @@ class FeedController:
 
         orderbook.apply_delta(
             seq=raw_msg["seq"],
-            side=_book_side(data["side"]),
+            side=outcome_side_to_book_side(data["side"]),
             price=parse_price_fp(data["price_dollars"]),
             delta=parse_count_fp(data["delta_fp"]),
         )
         return ticker
+
+    async def _unsubscribe_channel(self, channel: FeedChannel) -> None:
+        sid = self._sids.get(channel)
+
+        if sid is None:
+            return
+
+        await self._run_command("unsubscribe", {"sids": [sid]})
+
+        if self._sids.get(channel) == sid:
+            self._clear_channel(channel)
 
     def _update_sid_sequence(self, raw_msg: dict[str, Any]) -> None:
         sid = raw_msg.get("sid")
@@ -449,13 +451,3 @@ def _channel_tuple(channels: Iterable[FeedChannel]) -> tuple[FeedChannel, ...]:
             raise ValueError(f"unsupported feed channel: {channel!r}")
 
     return channel_tuple
-
-
-def _book_side(outcome_side: str) -> BookSide:
-    if outcome_side == "yes":
-        return "bid"
-
-    if outcome_side == "no":
-        return "ask"
-
-    raise ValueError(f"unknown orderbook side: {outcome_side!r}")

@@ -19,15 +19,16 @@ from kalshi_mm_bot.recording import (
     RecordedWebSocketClient,
     RecordingSessionReader,
 )
+from kalshi_mm_bot.recording.paths import latest_recording_dir, require_recording_path
 from kalshi_mm_bot.sim import (
-    BacktestSummary,
     BacktestUpdate,
+    backtest_summary_lines,
     fill_model_from_name,
+    format_backtest_summary,
     format_contract_count,
-    format_money_value,
     run_replay_backtest,
 )
-from kalshi_mm_bot.strategy import DumbMarketMakerStrategy
+from kalshi_mm_bot.strategy import STRATEGY_NAMES, strategy_from_name
 
 
 Row = TopOfBookRow
@@ -107,7 +108,8 @@ async def _run(args: argparse.Namespace) -> None:
 
 
 async def _run_simulation(args: argparse.Namespace) -> None:
-    strategy = DumbMarketMakerStrategy(
+    strategy = strategy_from_name(
+        args.strategy,
         count=parse_count_fp(args.order_size),
         max_position=parse_count_fp(args.max_position),
     )
@@ -129,7 +131,7 @@ async def _run_simulation(args: argparse.Namespace) -> None:
 
     print(f"Simulated {result.summary.event_count} event(s) from {result.recording}")
     print("")
-    print(_format_summary(result.summary))
+    print(format_backtest_summary(result.summary))
 
     if result.final_rows:
         print("")
@@ -219,7 +221,7 @@ def _format_backtest_watch(update: BacktestUpdate) -> str:
         f"fills={summary.fill_count} | updated={update.updated_ticker or '-'}"
     )
     lines = [header, ""]
-    lines.extend(_summary_lines(summary))
+    lines.extend(backtest_summary_lines(summary))
 
     if update.rows:
         lines.append("")
@@ -248,29 +250,6 @@ def _format_backtest_watch(update: BacktestUpdate) -> str:
 
     lines.append("")
     return "\n".join(lines)
-
-
-def _format_summary(summary: BacktestSummary) -> str:
-    return "\n".join(_summary_lines(summary))
-
-
-def _summary_lines(summary: BacktestSummary) -> list[str]:
-    rows = (
-        ("Strategy", summary.strategy_name),
-        ("Fill model", summary.fill_model),
-        ("Events", str(summary.event_count)),
-        ("Orders", str(summary.order_count)),
-        ("Open orders", str(summary.open_order_count)),
-        ("Fills", str(summary.fill_count)),
-        ("Buy filled", format_contract_count(summary.buy_filled_count)),
-        ("Sell filled", format_contract_count(summary.sell_filled_count)),
-        ("Position", format_contract_count(summary.position_count)),
-        ("Volume", format_contract_count(summary.volume_count)),
-        ("Cash", format_money_value(summary.cash_value)),
-        ("Mark to market", format_money_value(summary.mark_to_market_value)),
-    )
-    width = max(len(label) for label, _ in rows)
-    return [f"{label.ljust(width)}  {value}" for label, value in rows]
 
 
 def _format_watch_table(
@@ -347,7 +326,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--simulate",
         action="store_true",
-        help="Run the dumb market-maker simulation while replaying.",
+        help="Run a market-maker simulation while replaying.",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=STRATEGY_NAMES,
+        default="adaptive",
+        help="Strategy used with --simulate. Default: adaptive.",
     )
     parser.add_argument(
         "--fill-model",
@@ -421,43 +406,12 @@ def _recording_path(
         except EOFError:
             parser.error("provide a recording directory")
 
-        raw_path = _latest_recording_dir(parser) if not raw_text else Path(raw_text)
+        raw_path = latest_recording_dir(ROOT) if not raw_text else Path(raw_text)
 
-    path = _resolve_recording_path(raw_path)
-
-    if not (path / "manifest.json").exists():
-        parser.error(f"recording manifest not found: {path / 'manifest.json'}")
-
-    return path
-
-
-def _resolve_recording_path(path: Path) -> Path:
-    if path.is_absolute():
-        return path
-
-    cwd_path = Path.cwd() / path
-    if (cwd_path / "manifest.json").exists():
-        return cwd_path
-
-    return ROOT / path
-
-
-def _latest_recording_dir(parser: argparse.ArgumentParser) -> Path:
-    recordings_dir = ROOT / "recordings"
-
-    if not recordings_dir.exists():
-        parser.error(f"recordings directory not found: {recordings_dir}")
-
-    candidates = [
-        path
-        for path in recordings_dir.iterdir()
-        if path.is_dir() and (path / "manifest.json").exists()
-    ]
-
-    if not candidates:
-        parser.error(f"no recordings with manifest.json found under: {recordings_dir}")
-
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    try:
+        return require_recording_path(raw_path, root=ROOT)
+    except ValueError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

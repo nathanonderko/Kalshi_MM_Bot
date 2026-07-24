@@ -6,8 +6,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Iterable, Iterator
 from contextlib import suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
@@ -25,23 +25,30 @@ from kalshi_mm_bot.api.rest import KalshiRestClient
 from kalshi_mm_bot.api.websocket import KalshiWebSocketClient
 from kalshi_mm_bot.config import load_settings
 from kalshi_mm_bot.market.price import format_price_fp, parse_count_fp
+from kalshi_mm_bot.market.tickers import parse_ticker_tuple
 from kalshi_mm_bot.market.view import TopOfBookRow, top_of_book_rows
 from kalshi_mm_bot.recording import RecordingManifest, RecordingSessionWriter
 from kalshi_mm_bot.recording.clients import RecordingWebSocketClient
+from kalshi_mm_bot.recording.paths import (
+    default_recording_dir,
+    latest_recording_dir,
+    require_recording_path,
+)
 from kalshi_mm_bot.sim import (
     BacktestResult,
     BacktestSummary,
     BacktestUpdate,
+    backtest_summary_rows,
     fill_model_from_name,
     format_contract_count,
-    format_money_value,
     run_replay_backtest,
 )
-from kalshi_mm_bot.strategy import DumbMarketMakerStrategy
+from kalshi_mm_bot.strategy import STRATEGY_NAMES, strategy_from_name
 
 
 Row = TopOfBookRow
 Event = tuple[str, Any]
+MAX_FILL_ROWS = 250
 
 
 class OrderbookViewer(tk.Tk):
@@ -76,6 +83,7 @@ class OrderbookViewer(tk.Tk):
         self._record_status_var = tk.StringVar(value="Idle")
 
         self._replay_recording_var = tk.StringVar()
+        self._replay_strategy_var = tk.StringVar(value="adaptive")
         self._replay_fill_model_var = tk.StringVar(value="queue")
         self._replay_speed_var = tk.StringVar(value="0")
         self._replay_refresh_var = tk.StringVar(value="0.25")
@@ -224,51 +232,60 @@ class OrderbookViewer(tk.Tk):
         controls = ttk.Frame(tab)
         controls.pack(fill=tk.X, pady=(12, 0))
 
-        ttk.Label(controls, text="Fill model").grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, text="Strategy").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            controls,
+            textvariable=self._replay_strategy_var,
+            values=STRATEGY_NAMES,
+            width=12,
+            state="readonly",
+        ).grid(row=1, column=0, sticky="w", padx=(0, 8))
+
+        ttk.Label(controls, text="Fill model").grid(row=0, column=1, sticky="w")
         ttk.Combobox(
             controls,
             textvariable=self._replay_fill_model_var,
             values=("queue", "optimistic", "pessimistic"),
             width=14,
             state="readonly",
-        ).grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8))
 
-        ttk.Label(controls, text="Speed").grid(row=0, column=1, sticky="w")
+        ttk.Label(controls, text="Speed").grid(row=0, column=2, sticky="w")
         ttk.Entry(controls, textvariable=self._replay_speed_var, width=10).grid(
-            row=1,
-            column=1,
-            sticky="w",
-            padx=(0, 8),
-        )
-
-        ttk.Label(controls, text="Refresh sec").grid(row=0, column=2, sticky="w")
-        ttk.Entry(controls, textvariable=self._replay_refresh_var, width=10).grid(
             row=1,
             column=2,
             sticky="w",
             padx=(0, 8),
         )
 
-        ttk.Label(controls, text="Order size").grid(row=0, column=3, sticky="w")
-        ttk.Entry(controls, textvariable=self._replay_order_size_var, width=10).grid(
+        ttk.Label(controls, text="Refresh sec").grid(row=0, column=3, sticky="w")
+        ttk.Entry(controls, textvariable=self._replay_refresh_var, width=10).grid(
             row=1,
             column=3,
             sticky="w",
             padx=(0, 8),
         )
 
-        ttk.Label(controls, text="Max pos").grid(row=0, column=4, sticky="w")
-        ttk.Entry(controls, textvariable=self._replay_max_position_var, width=10).grid(
+        ttk.Label(controls, text="Order size").grid(row=0, column=4, sticky="w")
+        ttk.Entry(controls, textvariable=self._replay_order_size_var, width=10).grid(
             row=1,
             column=4,
             sticky="w",
             padx=(0, 8),
         )
 
-        ttk.Label(controls, text="Latency sec").grid(row=0, column=5, sticky="w")
-        ttk.Entry(controls, textvariable=self._replay_latency_var, width=10).grid(
+        ttk.Label(controls, text="Max pos").grid(row=0, column=5, sticky="w")
+        ttk.Entry(controls, textvariable=self._replay_max_position_var, width=10).grid(
             row=1,
             column=5,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(controls, text="Latency sec").grid(row=0, column=6, sticky="w")
+        ttk.Entry(controls, textvariable=self._replay_latency_var, width=10).grid(
+            row=1,
+            column=6,
             sticky="w",
             padx=(0, 8),
         )
@@ -278,16 +295,16 @@ class OrderbookViewer(tk.Tk):
             text="Run Backtest",
             command=self._start_replay,
         )
-        self._replay_start_button.grid(row=1, column=6, sticky="e", padx=(0, 6))
+        self._replay_start_button.grid(row=1, column=7, sticky="e", padx=(0, 6))
         self._replay_stop_button = ttk.Button(
             controls,
             text="Stop",
             command=self._stop_replay,
             state=tk.DISABLED,
         )
-        self._replay_stop_button.grid(row=1, column=7, sticky="e")
+        self._replay_stop_button.grid(row=1, column=8, sticky="e")
 
-        controls.columnconfigure(8, weight=1)
+        controls.columnconfigure(9, weight=1)
 
         panes = ttk.PanedWindow(tab, orient=tk.VERTICAL)
         panes.pack(fill=tk.BOTH, expand=True, pady=(12, 8))
@@ -357,7 +374,7 @@ class OrderbookViewer(tk.Tk):
         if self._worker is not None and self._worker.is_alive():
             return
 
-        tickers = _ticker_tuple_from_text(self._tickers_var.get())
+        tickers = parse_ticker_tuple(self._tickers_var.get())
         if not tickers:
             messagebox.showerror("Missing tickers", "Enter one or more market tickers.")
             return
@@ -372,7 +389,7 @@ class OrderbookViewer(tk.Tk):
             messagebox.showerror("Invalid refresh", "Refresh must be greater than zero.")
             return
 
-        self._clear_table()
+        _clear_tree(self._table)
         self._set_running(True)
         self._status_var.set("Connecting...")
         self._stop_event.clear()
@@ -392,7 +409,7 @@ class OrderbookViewer(tk.Tk):
         if self._record_worker is not None and self._record_worker.is_alive():
             return
 
-        tickers = _ticker_tuple_from_text(self._record_tickers_var.get())
+        tickers = parse_ticker_tuple(self._record_tickers_var.get())
         if not tickers:
             messagebox.showerror("Missing tickers", "Enter one or more market tickers.")
             return
@@ -444,7 +461,10 @@ class OrderbookViewer(tk.Tk):
             return
 
         try:
-            recording = _resolve_recording_path(Path(self._replay_recording_var.get().strip()))
+            recording = require_recording_path(
+                self._replay_recording_var.get().strip(),
+                root=ROOT,
+            )
         except ValueError as error:
             messagebox.showerror("Invalid recording", str(error))
             return
@@ -489,6 +509,7 @@ class OrderbookViewer(tk.Tk):
                 self._replay_events,
                 self._replay_stop_event,
                 recording,
+                self._replay_strategy_var.get(),
                 self._replay_fill_model_var.get(),
                 speed,
                 refresh,
@@ -519,7 +540,7 @@ class OrderbookViewer(tk.Tk):
 
     def _use_latest_recording(self) -> None:
         try:
-            self._replay_recording_var.set(str(_latest_recording_dir()))
+            self._replay_recording_var.set(str(latest_recording_dir(ROOT)))
         except ValueError as error:
             messagebox.showerror("No recordings", str(error))
 
@@ -536,83 +557,67 @@ class OrderbookViewer(tk.Tk):
         self.after(50, self._poll_events)
 
     def _poll_live_events(self) -> None:
-        try:
-            while True:
-                event, payload = self._events.get_nowait()
-
-                if event == "rows":
-                    self._update_rows(payload)
-                elif event == "status":
-                    self._status_var.set(payload)
-                elif event == "error":
-                    self._status_var.set("Error")
-                    self._set_running(False)
-                    messagebox.showerror("Kalshi orderbook viewer", payload)
-                elif event == "stopped":
-                    self._set_running(False)
-                    self._status_var.set("Stopped")
-        except queue.Empty:
-            pass
+        for event, payload in _drain_events(self._events):
+            if event == "rows":
+                _update_book_rows(self._table, payload)
+            elif event == "status":
+                self._status_var.set(payload)
+            elif event == "error":
+                self._status_var.set("Error")
+                self._set_running(False)
+                messagebox.showerror("Kalshi orderbook viewer", payload)
+            elif event == "stopped":
+                self._set_running(False)
+                self._status_var.set("Stopped")
 
     def _poll_record_events(self) -> None:
-        try:
-            while True:
-                event, payload = self._record_events.get_nowait()
-
-                if event == "status":
-                    self._record_status_var.set(payload)
-                    self._append_record_log(payload)
-                elif event == "error":
-                    self._record_status_var.set("Error")
-                    self._set_record_running(False)
-                    self._append_record_log(payload)
-                    messagebox.showerror("Kalshi recorder", payload)
-                elif event == "stopped":
-                    self._set_record_running(False)
-                    self._record_status_var.set("Stopped")
-                elif event == "recorded":
-                    self._record_status_var.set(payload)
-                    self._append_record_log(payload)
-        except queue.Empty:
-            pass
+        for event, payload in _drain_events(self._record_events):
+            if event == "status":
+                self._record_status_var.set(payload)
+                self._append_record_log(payload)
+            elif event == "error":
+                self._record_status_var.set("Error")
+                self._set_record_running(False)
+                self._append_record_log(payload)
+                messagebox.showerror("Kalshi recorder", payload)
+            elif event == "stopped":
+                self._set_record_running(False)
+                self._record_status_var.set("Stopped")
+            elif event == "recorded":
+                self._record_status_var.set(payload)
+                self._append_record_log(payload)
 
     def _poll_replay_events(self) -> None:
-        try:
-            while True:
-                event, payload = self._replay_events.get_nowait()
-
-                if event == "update":
-                    self._apply_backtest_update(payload)
-                elif event == "result":
-                    self._apply_backtest_result(payload)
-                elif event == "error":
-                    self._replay_status_var.set("Error")
-                    self._set_replay_running(False)
-                    messagebox.showerror("Kalshi backtest", payload)
-                elif event == "stopped":
-                    self._set_replay_running(False)
-                    if self._replay_stop_event.is_set():
-                        self._replay_status_var.set("Stopped")
-        except queue.Empty:
-            pass
-
-    def _update_rows(self, rows: tuple[Row, ...]) -> None:
-        _update_book_rows(self._table, rows)
-
-    def _clear_table(self) -> None:
-        _clear_tree(self._table)
+        for event, payload in _drain_events(self._replay_events):
+            if event == "update":
+                self._apply_backtest_update(payload)
+            elif event == "result":
+                self._apply_backtest_result(payload)
+            elif event == "error":
+                self._replay_status_var.set("Error")
+                self._set_replay_running(False)
+                messagebox.showerror("Kalshi backtest", payload)
+            elif event == "stopped":
+                self._set_replay_running(False)
+                if self._replay_stop_event.is_set():
+                    self._replay_status_var.set("Stopped")
 
     def _set_running(self, running: bool) -> None:
-        self._start_button.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self._stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+        _set_button_pair_running(self._start_button, self._stop_button, running)
 
     def _set_record_running(self, running: bool) -> None:
-        self._record_start_button.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self._record_stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+        _set_button_pair_running(
+            self._record_start_button,
+            self._record_stop_button,
+            running,
+        )
 
     def _set_replay_running(self, running: bool) -> None:
-        self._replay_start_button.configure(state=tk.DISABLED if running else tk.NORMAL)
-        self._replay_stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+        _set_button_pair_running(
+            self._replay_start_button,
+            self._replay_stop_button,
+            running,
+        )
 
     def _clear_record_log(self) -> None:
         self._record_log.configure(state=tk.NORMAL)
@@ -650,17 +655,17 @@ class OrderbookViewer(tk.Tk):
     def _update_summary(self, summary: BacktestSummary) -> None:
         _clear_tree(self._summary_table)
 
-        for metric, value in _summary_rows(summary):
+        for metric, value in backtest_summary_rows(summary):
             self._summary_table.insert("", tk.END, values=(metric, value))
 
     def _append_fills(self, update: BacktestUpdate) -> None:
-        for fill in update.recent_fills:
-            self._append_fill_row(fill)
-
-        self._trim_fill_rows()
+        self._append_fill_rows(update.recent_fills)
 
     def _append_result_fills(self, result: BacktestResult) -> None:
-        for fill in result.fills:
+        self._append_fill_rows(result.fills)
+
+    def _append_fill_rows(self, fills: Iterable[Any]) -> None:
+        for fill in fills:
             self._append_fill_row(fill)
 
         self._trim_fill_rows()
@@ -685,7 +690,7 @@ class OrderbookViewer(tk.Tk):
         )
 
     def _trim_fill_rows(self) -> None:
-        while len(self._fills_table.get_children("")) > 250:
+        while len(self._fills_table.get_children("")) > MAX_FILL_ROWS:
             oldest = self._fills_table.get_children("")[0]
             self._fills_table.delete(oldest)
             self._replay_seen_fills.discard(oldest)
@@ -774,7 +779,7 @@ async def _run_recording(
     settings = load_settings()
     environment = settings.environment(prod=prod)
     auth = KalshiAuth(settings.api_key_id, settings.private_key_path)
-    writer = RecordingSessionWriter.create(output_dir or _default_output_dir())
+    writer = RecordingSessionWriter.create(output_dir or default_recording_dir(ROOT))
     controller = FeedController(
         rest=KalshiRestClient(environment.rest_base_url, auth),
         ws=RecordingWebSocketClient(
@@ -838,6 +843,7 @@ def _replay_worker_main(
     events: queue.Queue[Event],
     stop_event: threading.Event,
     recording: Path,
+    strategy_name: str,
     fill_model_name: str,
     speed: float,
     refresh: float,
@@ -846,7 +852,11 @@ def _replay_worker_main(
     latency_sec: float,
 ) -> None:
     try:
-        strategy = DumbMarketMakerStrategy(count=order_size, max_position=max_position)
+        strategy = strategy_from_name(
+            strategy_name,
+            count=order_size,
+            max_position=max_position,
+        )
         fill_model = fill_model_from_name(fill_model_name)
 
         def on_update(update: BacktestUpdate) -> None:
@@ -913,65 +923,21 @@ def _clear_tree(table: ttk.Treeview) -> None:
         table.delete(item)
 
 
-def _summary_rows(summary: BacktestSummary) -> tuple[tuple[str, str], ...]:
-    return (
-        ("Strategy", summary.strategy_name),
-        ("Fill model", summary.fill_model),
-        ("Events", str(summary.event_count)),
-        ("Orders", str(summary.order_count)),
-        ("Open orders", str(summary.open_order_count)),
-        ("Fills", str(summary.fill_count)),
-        ("Buy filled", format_contract_count(summary.buy_filled_count)),
-        ("Sell filled", format_contract_count(summary.sell_filled_count)),
-        ("Position", format_contract_count(summary.position_count)),
-        ("Volume", format_contract_count(summary.volume_count)),
-        ("Cash", format_money_value(summary.cash_value)),
-        ("Mark to market", format_money_value(summary.mark_to_market_value)),
-    )
+def _drain_events(events: queue.Queue[Event]) -> Iterator[Event]:
+    while True:
+        try:
+            yield events.get_nowait()
+        except queue.Empty:
+            return
 
 
-def _ticker_tuple_from_text(raw_text: str) -> tuple[str, ...]:
-    tickers = raw_text.replace(",", " ").split()
-    return tuple(dict.fromkeys(ticker.upper() for ticker in tickers if ticker))
-
-
-def _resolve_recording_path(path: Path) -> Path:
-    if not str(path):
-        raise ValueError("Choose a recording directory.")
-
-    if path.is_absolute():
-        resolved = path
-    else:
-        cwd_path = Path.cwd() / path
-        resolved = cwd_path if (cwd_path / "manifest.json").exists() else ROOT / path
-
-    if not (resolved / "manifest.json").exists():
-        raise ValueError(f"Recording manifest not found: {resolved / 'manifest.json'}")
-
-    return resolved
-
-
-def _latest_recording_dir() -> Path:
-    recordings_dir = ROOT / "recordings"
-
-    if not recordings_dir.exists():
-        raise ValueError(f"Recordings directory not found: {recordings_dir}")
-
-    candidates = [
-        path
-        for path in recordings_dir.iterdir()
-        if path.is_dir() and (path / "manifest.json").exists()
-    ]
-
-    if not candidates:
-        raise ValueError(f"No recordings with manifest.json found under: {recordings_dir}")
-
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def _default_output_dir() -> Path:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return ROOT / "recordings" / timestamp
+def _set_button_pair_running(
+    start_button: ttk.Button,
+    stop_button: ttk.Button,
+    running: bool,
+) -> None:
+    start_button.configure(state=tk.DISABLED if running else tk.NORMAL)
+    stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
 
 
 def main() -> None:

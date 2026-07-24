@@ -3,12 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from kalshi_mm_bot.market.orderbook import Orderbook
-from kalshi_mm_bot.market.price import COUNT_SCALE, PRICE_SCALE, format_count_fp
+from kalshi_mm_bot.market.price import (
+    COUNT_DECIMALS,
+    COUNT_SCALE,
+    PRICE_DECIMALS,
+    PRICE_SCALE,
+    format_count_fp,
+)
 from kalshi_mm_bot.market.types import MarketTicker
 from kalshi_mm_bot.sim.fills import SimulatedFill
 
 
 CASH_SCALE = PRICE_SCALE * COUNT_SCALE
+CASH_DECIMALS = PRICE_DECIMALS + COUNT_DECIMALS
 
 
 @dataclass(slots=True)
@@ -24,8 +31,9 @@ class SimPortfolio:
         return self.cash.get(market_ticker, 0)
 
     def apply_fill(self, fill: SimulatedFill) -> None:
-        signed_count = fill.count if fill.action == "buy" else -fill.count
-        signed_cash = -fill.yes_price * fill.count if fill.action == "buy" else fill.yes_price * fill.count
+        direction = 1 if fill.action == "buy" else -1
+        signed_count = direction * fill.count
+        signed_cash = -direction * fill.yes_price * fill.count
 
         self.positions[fill.market_ticker] = self.position(fill.market_ticker) + signed_count
         self.cash[fill.market_ticker] = self.cash_value(fill.market_ticker) + signed_cash
@@ -58,7 +66,7 @@ def format_money_value(value: int) -> str:
     value = abs(value)
     whole = value // CASH_SCALE
     frac = value % CASH_SCALE
-    return f"{sign}{whole}.{frac:0{len(str(CASH_SCALE)) - 1}d}"
+    return f"{sign}{whole}.{frac:0{CASH_DECIMALS}d}"
 
 
 def format_contract_count(count: int) -> str:
