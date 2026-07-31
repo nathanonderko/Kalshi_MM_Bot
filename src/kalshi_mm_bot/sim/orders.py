@@ -3,7 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from kalshi_mm_bot.market.types import BookSide, MarketTicker, OrderAction, OrderId, OutcomeSide
+from kalshi_mm_bot.market.types import (
+    BookSide,
+    MarketTicker,
+    OrderAction,
+    OrderId,
+    OutcomeSide,
+    order_book_side,
+)
 from kalshi_mm_bot.strategy.types import QuoteIntent
 
 
@@ -55,10 +62,3 @@ class SimulatedOrder:
     @property
     def book_side(self) -> BookSide:
         return order_book_side(self.action, self.side)
-
-
-def order_book_side(action: OrderAction, side: OutcomeSide) -> BookSide:
-    if side != "yes":
-        raise NotImplementedError("simulated fills currently support YES orders only")
-
-    return "bid" if action == "buy" else "ask"

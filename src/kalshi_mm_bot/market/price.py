@@ -7,18 +7,25 @@ Internal representation:
         $0.5600 = 5600
         $0.0010 = 10
 
+    money: int
+        $1.000000 = 1000000
+        $0.017450 = 17450
+
     count: int
         1.00 contracts = 100
         10.00 contracts = 1000
         0.01 contracts = 1
 
-Kalshi live feeds normally emit price strings with 4 decimals and count
-strings with 2 decimals. The parsers keep a shorter-decimal fallback because
-the API contract allows prices/counts with fewer decimal places.
+Kalshi live feeds normally emit tradable price strings with 4 decimals and
+count strings with 2 decimals. Account/money fields can have 6 decimals after
+fee and fractional-contract arithmetic.
 """
 
 PRICE_DECIMALS = 4
 PRICE_SCALE = 10_000
+
+MONEY_DECIMALS = 6
+MONEY_SCALE = 1_000_000
 
 COUNT_DECIMALS = 2
 COUNT_SCALE = 100
@@ -31,6 +38,15 @@ def parse_price_fp(value: str) -> int:
         scale=PRICE_SCALE,
         decimals=PRICE_DECIMALS,
         label="price",
+    )
+
+
+def parse_money_fp(value: str) -> int:
+    return _parse_fixed_point(
+        value=value,
+        scale=MONEY_SCALE,
+        decimals=MONEY_DECIMALS,
+        label="money",
     )
 
 
@@ -66,7 +82,13 @@ def _parse_fixed_point(
         raise ValueError(f"invalid {label}: {value!r}")
 
     if len(frac_text) > decimals:
-        raise ValueError(f"too many {label} decimals: {value!r}")
+        supported_frac = frac_text[:decimals]
+        extra_frac = frac_text[decimals:]
+
+        if any(digit != "0" for digit in extra_frac):
+            raise ValueError(f"too many {label} decimals: {value!r}")
+
+        frac_text = supported_frac
 
     whole = int(whole_text) if whole_text else 0
     frac = int(frac_text.ljust(decimals, "0")) if frac_text else 0

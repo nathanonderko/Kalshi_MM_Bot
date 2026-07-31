@@ -51,3 +51,10 @@ def outcome_side_to_book_side(side: str) -> BookSide:
 
 def book_side_to_outcome_side(side: BookSide) -> OutcomeSide:
     return "yes" if side == "bid" else "no"
+
+
+def order_book_side(action: OrderAction, side: OutcomeSide) -> BookSide:
+    if side != "yes":
+        raise NotImplementedError("order routing currently supports YES orders only")
+
+    return "bid" if action == "buy" else "ask"

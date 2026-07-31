@@ -195,5 +195,7 @@ def _ticker_tuple(raw_tickers: list[str], parser: argparse.ArgumentParser) -> tu
         parser.error("provide at least one market ticker")
 
     return ticker_tuple
+
+
 if __name__ == "__main__":
     main()

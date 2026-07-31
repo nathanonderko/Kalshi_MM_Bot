@@ -24,6 +24,7 @@ from kalshi_mm_bot.api.feed_controller import FeedController, ORDERBOOK_CHANNEL
 from kalshi_mm_bot.api.rest import KalshiRestClient
 from kalshi_mm_bot.api.websocket import KalshiWebSocketClient
 from kalshi_mm_bot.config import load_settings
+from kalshi_mm_bot.live import LiveRunStats, run_live_strategy
 from kalshi_mm_bot.market.price import format_price_fp, parse_count_fp
 from kalshi_mm_bot.market.tickers import parse_ticker_tuple
 from kalshi_mm_bot.market.view import TopOfBookRow, top_of_book_rows
@@ -71,6 +72,10 @@ class OrderbookViewer(tk.Tk):
         self._replay_worker: threading.Thread | None = None
         self._replay_seen_fills: set[str] = set()
 
+        self._trade_events: queue.Queue[Event] = queue.Queue()
+        self._trade_stop_event = threading.Event()
+        self._trade_worker: threading.Thread | None = None
+
         self._tickers_var = tk.StringVar()
         self._prod_var = tk.BooleanVar(value=True)
         self._refresh_var = tk.StringVar(value="0.25")
@@ -92,6 +97,19 @@ class OrderbookViewer(tk.Tk):
         self._replay_latency_var = tk.StringVar(value="0")
         self._replay_status_var = tk.StringVar(value="Idle")
 
+        self._trade_tickers_var = tk.StringVar()
+        self._trade_strategy_var = tk.StringVar(value="adaptive")
+        self._trade_prod_var = tk.BooleanVar(value=False)
+        self._trade_execute_var = tk.BooleanVar(value=False)
+        self._trade_confirm_var = tk.BooleanVar(value=False)
+        self._trade_leave_orders_var = tk.BooleanVar(value=False)
+        self._trade_order_size_var = tk.StringVar(value="1.00")
+        self._trade_max_position_var = tk.StringVar(value="10.00")
+        self._trade_duration_var = tk.StringVar()
+        self._trade_min_requote_var = tk.StringVar(value="0.25")
+        self._trade_client_prefix_var = tk.StringVar(value="kmm")
+        self._trade_status_var = tk.StringVar(value="Idle")
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(50, self._poll_events)
@@ -103,6 +121,7 @@ class OrderbookViewer(tk.Tk):
         self._build_live_tab(notebook)
         self._build_record_tab(notebook)
         self._build_replay_tab(notebook)
+        self._build_trade_tab(notebook)
 
     def _build_live_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=12)
@@ -370,6 +389,112 @@ class OrderbookViewer(tk.Tk):
 
         ttk.Label(tab, textvariable=self._replay_status_var, anchor="w").pack(fill=tk.X)
 
+    def _build_trade_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook, padding=12)
+        notebook.add(tab, text="Live Trading")
+
+        controls = ttk.Frame(tab)
+        controls.pack(fill=tk.X)
+
+        ttk.Label(controls, text="Tickers").grid(row=0, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self._trade_tickers_var).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=(0, 8),
+        )
+
+        ttk.Label(controls, text="Strategy").grid(row=0, column=1, sticky="w")
+        ttk.Combobox(
+            controls,
+            textvariable=self._trade_strategy_var,
+            values=STRATEGY_NAMES,
+            width=12,
+            state="readonly",
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8))
+
+        ttk.Label(controls, text="Order size").grid(row=0, column=2, sticky="w")
+        ttk.Entry(controls, textvariable=self._trade_order_size_var, width=10).grid(
+            row=1,
+            column=2,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(controls, text="Max pos").grid(row=0, column=3, sticky="w")
+        ttk.Entry(controls, textvariable=self._trade_max_position_var, width=10).grid(
+            row=1,
+            column=3,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(controls, text="Duration sec").grid(row=0, column=4, sticky="w")
+        ttk.Entry(controls, textvariable=self._trade_duration_var, width=12).grid(
+            row=1,
+            column=4,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(controls, text="Requote sec").grid(row=0, column=5, sticky="w")
+        ttk.Entry(controls, textvariable=self._trade_min_requote_var, width=10).grid(
+            row=1,
+            column=5,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(controls, text="Client prefix").grid(row=0, column=6, sticky="w")
+        ttk.Entry(controls, textvariable=self._trade_client_prefix_var, width=12).grid(
+            row=1,
+            column=6,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        self._trade_start_button = ttk.Button(
+            controls,
+            text="Start",
+            command=self._start_trading,
+        )
+        self._trade_start_button.grid(row=1, column=7, sticky="e", padx=(0, 6))
+        self._trade_stop_button = ttk.Button(
+            controls,
+            text="Stop",
+            command=self._stop_trading,
+            state=tk.DISABLED,
+        )
+        self._trade_stop_button.grid(row=1, column=8, sticky="e")
+
+        controls.columnconfigure(0, weight=1)
+
+        options = ttk.Frame(tab)
+        options.pack(fill=tk.X, pady=(12, 0))
+        ttk.Checkbutton(options, text="Production", variable=self._trade_prod_var).pack(
+            side=tk.LEFT,
+            padx=(0, 16),
+        )
+        ttk.Checkbutton(options, text="Submit real orders", variable=self._trade_execute_var).pack(
+            side=tk.LEFT,
+            padx=(0, 16),
+        )
+        ttk.Checkbutton(options, text="Confirm production money", variable=self._trade_confirm_var).pack(
+            side=tk.LEFT,
+            padx=(0, 16),
+        )
+        ttk.Checkbutton(options, text="Leave orders on stop", variable=self._trade_leave_orders_var).pack(
+            side=tk.LEFT,
+        )
+
+        status_frame = ttk.Frame(tab)
+        status_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 8))
+        self._trade_log = tk.Text(status_frame, height=18, wrap=tk.WORD)
+        self._trade_log.pack(fill=tk.BOTH, expand=True)
+        self._trade_log.configure(state=tk.DISABLED)
+
+        ttk.Label(tab, textvariable=self._trade_status_var, anchor="w").pack(fill=tk.X)
+
     def _start(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             return
@@ -380,13 +505,9 @@ class OrderbookViewer(tk.Tk):
             return
 
         try:
-            refresh = float(self._refresh_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid refresh", "Refresh must be a number of seconds.")
-            return
-
-        if refresh <= 0:
-            messagebox.showerror("Invalid refresh", "Refresh must be greater than zero.")
+            refresh = _required_positive_float(self._refresh_var.get(), "Refresh")
+        except ValueError as error:
+            messagebox.showerror("Invalid refresh", str(error))
             return
 
         _clear_tree(self._table)
@@ -414,21 +535,11 @@ class OrderbookViewer(tk.Tk):
             messagebox.showerror("Missing tickers", "Enter one or more market tickers.")
             return
 
-        duration_sec: float | None
-        duration_text = self._record_duration_var.get().strip()
-
-        if duration_text:
-            try:
-                duration_sec = float(duration_text)
-            except ValueError:
-                messagebox.showerror("Invalid duration", "Duration must be blank or a number.")
-                return
-
-            if duration_sec <= 0:
-                messagebox.showerror("Invalid duration", "Duration must be greater than zero.")
-                return
-        else:
-            duration_sec = None
+        try:
+            duration_sec = _optional_positive_float(self._record_duration_var.get(), "Duration")
+        except ValueError as error:
+            messagebox.showerror("Invalid duration", str(error))
+            return
 
         output_text = self._record_output_var.get().strip()
         output_dir = Path(output_text) if output_text else None
@@ -470,33 +581,16 @@ class OrderbookViewer(tk.Tk):
             return
 
         try:
-            speed = float(self._replay_speed_var.get())
-            refresh = float(self._replay_refresh_var.get())
-            latency_sec = float(self._replay_latency_var.get())
-            order_size = parse_count_fp(self._replay_order_size_var.get())
-            max_position = parse_count_fp(self._replay_max_position_var.get())
+            speed = _required_nonnegative_float(self._replay_speed_var.get(), "Speed")
+            refresh = _required_positive_float(self._replay_refresh_var.get(), "Refresh")
+            latency_sec = _required_nonnegative_float(self._replay_latency_var.get(), "Latency")
+            order_size = _required_positive_count(self._replay_order_size_var.get(), "Order size")
+            max_position = _required_nonnegative_count(
+                self._replay_max_position_var.get(),
+                "Max position",
+            )
         except ValueError as error:
             messagebox.showerror("Invalid backtest setting", str(error))
-            return
-
-        if speed < 0:
-            messagebox.showerror("Invalid speed", "Speed must be non-negative.")
-            return
-
-        if refresh <= 0:
-            messagebox.showerror("Invalid refresh", "Refresh must be greater than zero.")
-            return
-
-        if latency_sec < 0:
-            messagebox.showerror("Invalid latency", "Latency must be non-negative.")
-            return
-
-        if order_size <= 0:
-            messagebox.showerror("Invalid order size", "Order size must be greater than zero.")
-            return
-
-        if max_position < 0:
-            messagebox.showerror("Invalid max position", "Max position must be non-negative.")
             return
 
         self._clear_replay_tables()
@@ -526,6 +620,82 @@ class OrderbookViewer(tk.Tk):
         self._replay_status_var.set("Stopping...")
         self._replay_stop_button.configure(state=tk.DISABLED)
 
+    def _start_trading(self) -> None:
+        if self._trade_worker is not None and self._trade_worker.is_alive():
+            return
+
+        tickers = parse_ticker_tuple(self._trade_tickers_var.get())
+        if not tickers:
+            messagebox.showerror("Missing tickers", "Enter one or more market tickers.")
+            return
+
+        try:
+            order_size = _required_positive_count(self._trade_order_size_var.get(), "Order size")
+            max_position = _required_nonnegative_count(
+                self._trade_max_position_var.get(),
+                "Max position",
+            )
+            min_requote = _required_nonnegative_float(
+                self._trade_min_requote_var.get(),
+                "Requote seconds",
+            )
+            duration_sec = _optional_positive_float(self._trade_duration_var.get(), "Duration")
+        except ValueError as error:
+            messagebox.showerror("Invalid live trading setting", str(error))
+            return
+
+        client_prefix = self._trade_client_prefix_var.get().strip()
+        if not client_prefix:
+            messagebox.showerror("Invalid client prefix", "Client prefix is required.")
+            return
+
+        prod = self._trade_prod_var.get()
+        execute = self._trade_execute_var.get()
+
+        if prod and execute and not self._trade_confirm_var.get():
+            messagebox.showerror(
+                "Confirmation required",
+                "Production live trading requires Confirm production money.",
+            )
+            return
+
+        if execute:
+            environment = "production" if prod else "demo"
+            if not messagebox.askyesno(
+                "Submit live orders",
+                f"Submit real orders on {environment} for {', '.join(tickers)}?",
+            ):
+                return
+
+        self._clear_trade_log()
+        self._set_trade_running(True)
+        self._trade_status_var.set("Starting...")
+        self._trade_stop_event.clear()
+        self._trade_worker = threading.Thread(
+            target=_trade_worker_main,
+            args=(
+                self._trade_events,
+                self._trade_stop_event,
+                tickers,
+                self._trade_strategy_var.get(),
+                order_size,
+                max_position,
+                prod,
+                not execute,
+                duration_sec,
+                client_prefix,
+                min_requote,
+                not self._trade_leave_orders_var.get(),
+            ),
+            daemon=True,
+        )
+        self._trade_worker.start()
+
+    def _stop_trading(self) -> None:
+        self._trade_stop_event.set()
+        self._trade_status_var.set("Stopping...")
+        self._trade_stop_button.configure(state=tk.DISABLED)
+
     def _browse_record_output(self) -> None:
         path = filedialog.askdirectory(mustexist=False)
 
@@ -548,12 +718,14 @@ class OrderbookViewer(tk.Tk):
         self._stop_event.set()
         self._record_stop_event.set()
         self._replay_stop_event.set()
+        self._trade_stop_event.set()
         self.destroy()
 
     def _poll_events(self) -> None:
         self._poll_live_events()
         self._poll_record_events()
         self._poll_replay_events()
+        self._poll_trade_events()
         self.after(50, self._poll_events)
 
     def _poll_live_events(self) -> None:
@@ -602,6 +774,24 @@ class OrderbookViewer(tk.Tk):
                 if self._replay_stop_event.is_set():
                     self._replay_status_var.set("Stopped")
 
+    def _poll_trade_events(self) -> None:
+        for event, payload in _drain_events(self._trade_events):
+            if event == "status":
+                self._trade_status_var.set(payload)
+                self._append_trade_log(payload)
+            elif event == "error":
+                self._trade_status_var.set("Error")
+                self._set_trade_running(False)
+                self._append_trade_log(payload)
+                messagebox.showerror("Kalshi live trading", payload)
+            elif event == "result":
+                self._trade_status_var.set(_trade_result_status(payload))
+                self._append_trade_log(_trade_result_status(payload))
+            elif event == "stopped":
+                self._set_trade_running(False)
+                if self._trade_stop_event.is_set():
+                    self._trade_status_var.set("Stopped")
+
     def _set_running(self, running: bool) -> None:
         _set_button_pair_running(self._start_button, self._stop_button, running)
 
@@ -619,16 +809,24 @@ class OrderbookViewer(tk.Tk):
             running,
         )
 
+    def _set_trade_running(self, running: bool) -> None:
+        _set_button_pair_running(
+            self._trade_start_button,
+            self._trade_stop_button,
+            running,
+        )
+
     def _clear_record_log(self) -> None:
-        self._record_log.configure(state=tk.NORMAL)
-        self._record_log.delete("1.0", tk.END)
-        self._record_log.configure(state=tk.DISABLED)
+        _clear_text(self._record_log)
 
     def _append_record_log(self, line: str) -> None:
-        self._record_log.configure(state=tk.NORMAL)
-        self._record_log.insert(tk.END, line + "\n")
-        self._record_log.see(tk.END)
-        self._record_log.configure(state=tk.DISABLED)
+        _append_text(self._record_log, line)
+
+    def _clear_trade_log(self) -> None:
+        _clear_text(self._trade_log)
+
+    def _append_trade_log(self, line: str) -> None:
+        _append_text(self._trade_log, line)
 
     def _clear_replay_tables(self) -> None:
         _clear_tree(self._replay_table)
@@ -880,6 +1078,50 @@ def _replay_worker_main(
         events.put(("error", str(error)))
 
 
+def _trade_worker_main(
+    events: queue.Queue[Event],
+    stop_event: threading.Event,
+    tickers: tuple[str, ...],
+    strategy_name: str,
+    order_size: int,
+    max_position: int,
+    prod: bool,
+    dry_run: bool,
+    duration_sec: float | None,
+    client_prefix: str,
+    min_requote_sec: float,
+    cancel_on_stop: bool,
+) -> None:
+    try:
+        strategy = strategy_from_name(
+            strategy_name,
+            count=order_size,
+            max_position=max_position,
+        )
+
+        def on_status(line: str) -> None:
+            events.put(("status", line))
+
+        result = asyncio.run(
+            run_live_strategy(
+                tickers=tickers,
+                strategy=strategy,
+                prod=prod,
+                dry_run=dry_run,
+                duration_seconds=duration_sec,
+                client_prefix=client_prefix,
+                min_requote_seconds=min_requote_sec,
+                cancel_on_stop=cancel_on_stop,
+                status=on_status,
+                stop_requested=stop_event.is_set,
+            )
+        )
+        events.put(("result", result))
+        events.put(("stopped", None))
+    except Exception as error:
+        events.put(("error", str(error)))
+
+
 def _configure_book_table(table: ttk.Treeview) -> None:
     headings = {
         "ticker": "Ticker",
@@ -923,6 +1165,19 @@ def _clear_tree(table: ttk.Treeview) -> None:
         table.delete(item)
 
 
+def _clear_text(text: tk.Text) -> None:
+    text.configure(state=tk.NORMAL)
+    text.delete("1.0", tk.END)
+    text.configure(state=tk.DISABLED)
+
+
+def _append_text(text: tk.Text, line: str) -> None:
+    text.configure(state=tk.NORMAL)
+    text.insert(tk.END, line + "\n")
+    text.see(tk.END)
+    text.configure(state=tk.DISABLED)
+
+
 def _drain_events(events: queue.Queue[Event]) -> Iterator[Event]:
     while True:
         try:
@@ -938,6 +1193,60 @@ def _set_button_pair_running(
 ) -> None:
     start_button.configure(state=tk.DISABLED if running else tk.NORMAL)
     stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+
+
+def _required_positive_float(raw_text: str, label: str) -> float:
+    value = float(raw_text)
+
+    if value <= 0:
+        raise ValueError(f"{label} must be greater than zero.")
+
+    return value
+
+
+def _required_nonnegative_float(raw_text: str, label: str) -> float:
+    value = float(raw_text)
+
+    if value < 0:
+        raise ValueError(f"{label} must be non-negative.")
+
+    return value
+
+
+def _required_positive_count(raw_text: str, label: str) -> int:
+    count = parse_count_fp(raw_text)
+
+    if count <= 0:
+        raise ValueError(f"{label} must be greater than zero.")
+
+    return count
+
+
+def _required_nonnegative_count(raw_text: str, label: str) -> int:
+    count = parse_count_fp(raw_text)
+
+    if count < 0:
+        raise ValueError(f"{label} must be non-negative.")
+
+    return count
+
+
+def _optional_positive_float(raw_text: str, label: str) -> float | None:
+    text = raw_text.strip()
+
+    if not text:
+        return None
+
+    return _required_positive_float(text, label)
+
+
+def _trade_result_status(stats: LiveRunStats) -> str:
+    mode = "dry-run" if stats.dry_run else "LIVE"
+    return (
+        f"Done {mode}: events {stats.event_count}, "
+        f"book updates {stats.orderbook_updates}, fills {stats.fill_count}, "
+        f"creates {stats.create_count}, cancels {stats.cancel_count}"
+    )
 
 
 def main() -> None:

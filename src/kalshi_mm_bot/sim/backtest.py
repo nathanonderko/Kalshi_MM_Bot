@@ -12,6 +12,7 @@ from kalshi_mm_bot.recording import RecordedRestClient, RecordedWebSocketClient,
 from kalshi_mm_bot.sim.accounting import SimPortfolio
 from kalshi_mm_bot.sim.fills import FillModel, SimulatedFill
 from kalshi_mm_bot.sim.orders import SimulatedOrder
+from kalshi_mm_bot.strategy.quotes import quote_intent_map
 from kalshi_mm_bot.strategy.types import QuoteIntent, Strategy, StrategyContext
 
 
@@ -121,8 +122,8 @@ class SimulatedOrderManager:
         orderbooks: dict[str, Orderbook],
         context: StrategyContext,
     ) -> None:
+        wanted = quote_intent_map(intents)
         self._settle_due_orders(orderbooks, context)
-        wanted = {intent.quote_id: intent for intent in intents}
 
         for order in tuple(self.orders.values()):
             if order.market_ticker != market_ticker or not _is_live_order(order):

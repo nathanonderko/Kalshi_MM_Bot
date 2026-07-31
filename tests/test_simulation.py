@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from kalshi_mm_bot.api.feed_controller import ORDERBOOK_CHANNEL
 from kalshi_mm_bot.market.orderbook import Orderbook
 from kalshi_mm_bot.market.price import COUNT_SCALE, parse_count_fp, parse_price_fp
@@ -180,6 +182,25 @@ def test_queue_fill_model_accounts_for_queue_ahead() -> None:
     assert first == ()
     assert len(second) == 1
     assert second[0].reason == "queue_through"
+
+
+def test_simulated_order_manager_rejects_duplicate_quote_ids() -> None:
+    book = make_book()
+    manager = SimulatedOrderManager(
+        fill_model=OptimisticFillModel(),
+        portfolio=SimPortfolio(),
+    )
+    context = StrategyContext(event_count=1, offset_seconds=0)
+
+    with pytest.raises(ValueError, match="duplicate quote_id"):
+        manager.sync_market_quotes(
+            "M1",
+            [buy_intent(), buy_intent(count=COUNT_SCALE // 2)],
+            {"M1": book},
+            context,
+        )
+
+    assert manager.orders == {}
 
 
 def test_replay_backtest_runs_strategy_against_recording(tmp_path) -> None:

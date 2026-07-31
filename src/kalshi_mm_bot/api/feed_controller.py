@@ -2,27 +2,38 @@ from __future__ import annotations
 
 from asyncio import Future, TimeoutError, get_running_loop, wait_for
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+from kalshi_mm_bot.api.parser import ParsedWsMessage, parse_ws_message
 from kalshi_mm_bot.api.rest import KalshiRestClient
 from kalshi_mm_bot.api.websocket import KalshiWebSocketClient
 from kalshi_mm_bot.market.orderbook import Orderbook, SequenceGapError
 from kalshi_mm_bot.market.price import parse_count_fp, parse_price_fp
 from kalshi_mm_bot.market.types import PriceRange, outcome_side_to_book_side
 
-FeedChannel = Literal["orderbook_delta", "fill", "market_positions"]
+FeedChannel = Literal["orderbook_delta", "fill", "market_positions", "user_orders"]
 SubscriptionAction = Literal["add_markets", "delete_markets"]
 
 ORDERBOOK_CHANNEL: FeedChannel = "orderbook_delta"
 FILL_CHANNEL: FeedChannel = "fill"
 MARKET_POSITIONS_CHANNEL: FeedChannel = "market_positions"
+USER_ORDERS_CHANNEL: FeedChannel = "user_orders"
 
 FEED_CHANNELS: tuple[FeedChannel, ...] = (
     ORDERBOOK_CHANNEL,
     FILL_CHANNEL,
     MARKET_POSITIONS_CHANNEL,
+    USER_ORDERS_CHANNEL,
 )
 DEFAULT_FEED_CHANNELS: tuple[FeedChannel, ...] = (ORDERBOOK_CHANNEL,)
+
+
+@dataclass(frozen=True, slots=True)
+class FeedUpdate:
+    raw_msg: dict[str, Any]
+    updated_ticker: str | None
+    parsed: ParsedWsMessage | None
 
 
 class FeedControllerError(Exception):
@@ -118,6 +129,9 @@ class FeedController:
 
     async def recv(self) -> str | None:
         return await self._recv_and_dispatch()
+
+    async def recv_update(self, timeout: float | None = None) -> FeedUpdate:
+        return await self._recv_update(timeout=timeout)
 
     async def run_forever(self) -> None:
         if self._receiver_running:
@@ -292,12 +306,19 @@ class FeedController:
         return waiter.result()
 
     async def _recv_and_dispatch(self, timeout: float | None = None) -> str | None:
+        return (await self._recv_update(timeout=timeout)).updated_ticker
+
+    async def _recv_update(self, timeout: float | None = None) -> FeedUpdate:
         if timeout is None:
             raw_msg = await self.ws.recv_json()
         else:
             raw_msg = await wait_for(self.ws.recv_json(), timeout=timeout)
 
-        return self.handle_message(raw_msg)
+        return FeedUpdate(
+            raw_msg=raw_msg,
+            updated_ticker=self.handle_message(raw_msg),
+            parsed=parse_ws_message(raw_msg),
+        )
 
     def _handle_control_message(self, raw_msg: dict[str, Any]) -> None:
         msg_type = raw_msg.get("type")

@@ -1,6 +1,7 @@
+from collections.abc import Callable
 from typing import Any
 
-from kalshi_mm_bot.market.price import parse_count_fp, parse_price_fp
+from kalshi_mm_bot.market.price import parse_count_fp, parse_money_fp, parse_price_fp
 from kalshi_mm_bot.market.types import MarketPosition, OrderFill, PriceRange
 
 
@@ -22,9 +23,9 @@ def parse_ws_message(msg: dict[str, Any]) -> ParsedWsMessage | None:
 def parse_price_ranges(raw_market: dict[str, Any]) -> tuple[PriceRange, ...]:
     return tuple(
         PriceRange(
-            start=parse_price_fp(price_range["start"]),
-            end=parse_price_fp(price_range["end"]),
-            step=parse_price_fp(price_range["step"]),
+            start=_parse_field(parse_price_fp, price_range, "start"),
+            end=_parse_field(parse_price_fp, price_range, "end"),
+            step=_parse_field(parse_price_fp, price_range, "step"),
         )
         for price_range in raw_market["price_ranges"]
     )
@@ -40,9 +41,9 @@ def parse_order_fill(msg: dict[str, Any]) -> OrderFill:
         is_taker=data["is_taker"],
         side=data["side"],
         action=data["action"],
-        yes_price=parse_price_fp(data["yes_price_dollars"]),
-        count=parse_count_fp(data["count_fp"]),
-        post_position=parse_count_fp(data["post_position_fp"]),
+        yes_price=_parse_field(parse_price_fp, data, "yes_price_dollars"),
+        count=_parse_field(parse_count_fp, data, "count_fp"),
+        post_position=_parse_field(parse_count_fp, data, "post_position_fp"),
     )
 
 
@@ -51,9 +52,22 @@ def parse_market_position(msg: dict[str, Any]) -> MarketPosition:
 
     return MarketPosition(
         market_ticker=data["market_ticker"],
-        position=parse_count_fp(data["position_fp"]),
-        position_cost=parse_price_fp(data["position_cost_dollars"]),
-        realized_pnl=parse_price_fp(data["realized_pnl_dollars"]),
-        fees_paid=parse_price_fp(data["fees_paid_dollars"]),
-        volume=parse_count_fp(data["volume_fp"]),
+        position=_parse_field(parse_count_fp, data, "position_fp"),
+        position_cost=_parse_field(parse_money_fp, data, "position_cost_dollars"),
+        realized_pnl=_parse_field(parse_money_fp, data, "realized_pnl_dollars"),
+        fees_paid=_parse_field(parse_money_fp, data, "fees_paid_dollars"),
+        volume=_parse_field(parse_count_fp, data, "volume_fp"),
     )
+
+
+def _parse_field(
+    parser: Callable[[str], int],
+    data: dict[str, Any],
+    field: str,
+) -> int:
+    value = data[field]
+
+    try:
+        return parser(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field}={value!r}: {error}") from error

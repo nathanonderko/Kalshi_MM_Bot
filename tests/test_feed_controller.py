@@ -104,6 +104,7 @@ def test_subscribe_all_channels_tracks_one_sid_per_channel() -> None:
             subscribed(1, "orderbook_delta", 10),
             subscribed(2, "fill", 11),
             subscribed(3, "market_positions", 12),
+            subscribed(4, "user_orders", 13),
         ]
     )
     controller = FeedController(rest=rest, ws=ws)
@@ -114,12 +115,19 @@ def test_subscribe_all_channels_tracks_one_sid_per_channel() -> None:
         "orderbook_delta": 10,
         "fill": 11,
         "market_positions": 12,
+        "user_orders": 13,
     }
     assert controller.subscribed_markets["orderbook_delta"] == frozenset({"M1", "M2"})
     assert controller.subscribed_markets["fill"] == frozenset({"M1", "M2"})
     assert controller.subscribed_markets["market_positions"] == frozenset({"M1", "M2"})
+    assert controller.subscribed_markets["user_orders"] == frozenset({"M1", "M2"})
     assert rest.requests == [["M1", "M2"]]
-    assert [payload["cmd"] for payload in ws.sent] == ["subscribe", "subscribe", "subscribe"]
+    assert [payload["cmd"] for payload in ws.sent] == [
+        "subscribe",
+        "subscribe",
+        "subscribe",
+        "subscribe",
+    ]
     assert ws.sent[0]["params"] == {
         "channels": ["orderbook_delta"],
         "market_tickers": ["M1", "M2"],
@@ -257,9 +265,11 @@ def test_unsubscribe_channels_sends_one_command_per_sid() -> None:
             subscribed(1, "orderbook_delta", 10),
             subscribed(2, "fill", 11),
             subscribed(3, "market_positions", 12),
-            unsubscribed(4, 10, seq=1),
-            unsubscribed(5, 11, seq=1),
-            unsubscribed(6, 12, seq=1),
+            subscribed(4, "user_orders", 13),
+            unsubscribed(5, 10, seq=1),
+            unsubscribed(6, 11, seq=1),
+            unsubscribed(7, 12, seq=1),
+            unsubscribed(8, 13, seq=1),
         ]
     )
     controller = FeedController(rest=rest, ws=ws)
@@ -267,10 +277,11 @@ def test_unsubscribe_channels_sends_one_command_per_sid() -> None:
     asyncio.run(controller.subscribe(["M1"], channels=FEED_CHANNELS))
     asyncio.run(controller.unsubscribe_channels(FEED_CHANNELS))
 
-    assert ws.sent[3:] == [
-        {"id": 4, "cmd": "unsubscribe", "params": {"sids": [10]}},
-        {"id": 5, "cmd": "unsubscribe", "params": {"sids": [11]}},
-        {"id": 6, "cmd": "unsubscribe", "params": {"sids": [12]}},
+    assert ws.sent[4:] == [
+        {"id": 5, "cmd": "unsubscribe", "params": {"sids": [10]}},
+        {"id": 6, "cmd": "unsubscribe", "params": {"sids": [11]}},
+        {"id": 7, "cmd": "unsubscribe", "params": {"sids": [12]}},
+        {"id": 8, "cmd": "unsubscribe", "params": {"sids": [13]}},
     ]
     assert controller.sids == {}
 
