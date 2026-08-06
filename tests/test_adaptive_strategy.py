@@ -2,7 +2,11 @@ from kalshi_mm_bot.market.orderbook import Orderbook
 from kalshi_mm_bot.market.price import COUNT_SCALE, parse_count_fp, parse_price_fp
 from kalshi_mm_bot.market.types import PriceRange
 from kalshi_mm_bot.sim import SimPortfolio
-from kalshi_mm_bot.strategy import AdaptivePredictionMarketMakerStrategy, strategy_from_name
+from kalshi_mm_bot.strategy import (
+    AdaptivePredictionMarketMakerStrategy,
+    parse_adaptive_params,
+    strategy_from_name,
+)
 from kalshi_mm_bot.strategy.types import StrategyContext
 
 PRICE_RANGES = (PriceRange(start=0, end=10000, step=100),)
@@ -104,3 +108,27 @@ def test_strategy_factory_keeps_dumb_benchmark_selectable() -> None:
 
     assert adaptive.name == "adaptive_prediction_mm"
     assert dumb.name == "dumb_join_top"
+
+
+def test_parse_adaptive_params_accepts_human_scale_values() -> None:
+    params = parse_adaptive_params(
+        "min_count=0.50,min_profit_edge=0.0030,liquidity_fraction_bps=2500"
+    )
+
+    assert params == {
+        "min_count": parse_count_fp("0.50"),
+        "min_profit_edge": parse_price_fp("0.0030"),
+        "liquidity_fraction_bps": 2500,
+    }
+
+
+def test_strategy_factory_applies_adaptive_overrides() -> None:
+    strategy = strategy_from_name(
+        "adaptive",
+        count=COUNT_SCALE,
+        max_position=10 * COUNT_SCALE,
+        adaptive_params={"min_profit_edge": parse_price_fp("0.0100")},
+    )
+
+    assert isinstance(strategy, AdaptivePredictionMarketMakerStrategy)
+    assert strategy.min_profit_edge == parse_price_fp("0.0100")

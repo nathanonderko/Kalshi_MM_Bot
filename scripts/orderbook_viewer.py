@@ -8,6 +8,7 @@ import time
 import tkinter as tk
 from collections.abc import Iterable, Iterator
 from contextlib import suppress
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
@@ -25,7 +26,12 @@ from kalshi_mm_bot.api.rest import KalshiRestClient
 from kalshi_mm_bot.api.websocket import KalshiWebSocketClient
 from kalshi_mm_bot.config import load_settings
 from kalshi_mm_bot.live import LiveRunStats, run_live_strategy
-from kalshi_mm_bot.market.price import format_price_fp, parse_count_fp
+from kalshi_mm_bot.market.price import (
+    format_count_fp,
+    format_price_fp,
+    parse_count_fp,
+    parse_price_fp,
+)
 from kalshi_mm_bot.market.tickers import parse_ticker_tuple
 from kalshi_mm_bot.market.view import TopOfBookRow, top_of_book_rows
 from kalshi_mm_bot.recording import RecordingManifest, RecordingSessionWriter
@@ -39,12 +45,22 @@ from kalshi_mm_bot.sim import (
     BacktestResult,
     BacktestSummary,
     BacktestUpdate,
+    DEFAULT_MAX_OPTIMIZATION_TRIALS,
     backtest_summary_rows,
     fill_model_from_name,
     format_contract_count,
+    format_optimization_settings,
+    format_optimization_trial,
+    optimize_adaptive_backtest,
     run_replay_backtest,
 )
-from kalshi_mm_bot.strategy import STRATEGY_NAMES, strategy_from_name
+from kalshi_mm_bot.strategy import (
+    STRATEGY_NAMES,
+    RequotePolicy,
+    format_adaptive_params,
+    parse_adaptive_params,
+    strategy_from_name,
+)
 
 
 Row = TopOfBookRow
@@ -95,6 +111,17 @@ class OrderbookViewer(tk.Tk):
         self._replay_order_size_var = tk.StringVar(value="1.00")
         self._replay_max_position_var = tk.StringVar(value="10.00")
         self._replay_latency_var = tk.StringVar(value="0")
+        self._replay_adaptive_params_var = tk.StringVar()
+        self._replay_optimize_var = tk.BooleanVar(value=False)
+        self._replay_optimize_mode_var = tk.StringVar(value="adaptive")
+        self._replay_optimizer_balance_var = tk.StringVar()
+        self._replay_optimize_max_trials_var = tk.StringVar(
+            value=str(DEFAULT_MAX_OPTIMIZATION_TRIALS)
+        )
+        self._replay_min_requote_var = tk.StringVar(value="0")
+        self._replay_min_order_rest_var = tk.StringVar(value="0")
+        self._replay_requote_price_threshold_var = tk.StringVar(value="0")
+        self._replay_requote_size_threshold_var = tk.StringVar(value="0")
         self._replay_status_var = tk.StringVar(value="Idle")
 
         self._trade_tickers_var = tk.StringVar()
@@ -107,6 +134,10 @@ class OrderbookViewer(tk.Tk):
         self._trade_max_position_var = tk.StringVar(value="10.00")
         self._trade_duration_var = tk.StringVar()
         self._trade_min_requote_var = tk.StringVar(value="0.25")
+        self._trade_min_order_rest_var = tk.StringVar(value="0.50")
+        self._trade_requote_price_threshold_var = tk.StringVar(value="0.0200")
+        self._trade_requote_size_threshold_var = tk.StringVar(value="5000")
+        self._trade_adaptive_params_var = tk.StringVar()
         self._trade_client_prefix_var = tk.StringVar(value="kmm")
         self._trade_status_var = tk.StringVar(value="Idle")
 
@@ -246,7 +277,9 @@ class OrderbookViewer(tk.Tk):
             side=tk.LEFT,
             padx=(0, 6),
         )
-        ttk.Button(recording_row, text="Newest", command=self._use_latest_recording).pack(side=tk.LEFT)
+        ttk.Button(recording_row, text="Newest", command=self._use_latest_recording).pack(
+            side=tk.LEFT
+        )
 
         controls = ttk.Frame(tab)
         controls.pack(fill=tk.X, pady=(12, 0))
@@ -324,6 +357,90 @@ class OrderbookViewer(tk.Tk):
         self._replay_stop_button.grid(row=1, column=8, sticky="e")
 
         controls.columnconfigure(9, weight=1)
+
+        advanced = ttk.Frame(tab)
+        advanced.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(advanced, text="Adaptive params").grid(row=0, column=0, sticky="w")
+        ttk.Entry(advanced, textvariable=self._replay_adaptive_params_var).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=(0, 8),
+        )
+        ttk.Checkbutton(
+            advanced,
+            text="Optimize",
+            variable=self._replay_optimize_var,
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8))
+
+        ttk.Label(advanced, text="Opt mode").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(
+            advanced,
+            textvariable=self._replay_optimize_mode_var,
+            values=("adaptive", "all"),
+            width=10,
+            state="readonly",
+        ).grid(row=1, column=2, sticky="w", padx=(0, 8))
+
+        ttk.Label(advanced, text="Balance").grid(row=0, column=3, sticky="w")
+        ttk.Entry(advanced, textvariable=self._replay_optimizer_balance_var, width=10).grid(
+            row=1,
+            column=3,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(advanced, text="Max trials").grid(row=0, column=4, sticky="w")
+        ttk.Entry(advanced, textvariable=self._replay_optimize_max_trials_var, width=10).grid(
+            row=1,
+            column=4,
+            sticky="w",
+        )
+
+        requote_row = ttk.Frame(tab)
+        requote_row.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(requote_row, text="Min requote").grid(row=0, column=0, sticky="w")
+        ttk.Entry(requote_row, textvariable=self._replay_min_requote_var, width=10).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(requote_row, text="Min rest").grid(row=0, column=1, sticky="w")
+        ttk.Entry(requote_row, textvariable=self._replay_min_order_rest_var, width=10).grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(requote_row, text="Price thresh").grid(row=0, column=2, sticky="w")
+        ttk.Entry(
+            requote_row,
+            textvariable=self._replay_requote_price_threshold_var,
+            width=10,
+        ).grid(
+            row=1,
+            column=2,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(requote_row, text="Size bps").grid(row=0, column=3, sticky="w")
+        ttk.Entry(
+            requote_row,
+            textvariable=self._replay_requote_size_threshold_var,
+            width=10,
+        ).grid(
+            row=1,
+            column=3,
+            sticky="w",
+        )
+
+        advanced.columnconfigure(0, weight=1)
 
         panes = ttk.PanedWindow(tab, orient=tk.VERTICAL)
         panes.pack(fill=tk.BOTH, expand=True, pady=(12, 8))
@@ -469,6 +586,42 @@ class OrderbookViewer(tk.Tk):
 
         controls.columnconfigure(0, weight=1)
 
+        advanced = ttk.Frame(tab)
+        advanced.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(advanced, text="Adaptive params").grid(row=0, column=0, sticky="w")
+        ttk.Entry(advanced, textvariable=self._trade_adaptive_params_var).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=(0, 8),
+        )
+
+        ttk.Label(advanced, text="Min rest").grid(row=0, column=1, sticky="w")
+        ttk.Entry(advanced, textvariable=self._trade_min_order_rest_var, width=10).grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(advanced, text="Price thresh").grid(row=0, column=2, sticky="w")
+        ttk.Entry(advanced, textvariable=self._trade_requote_price_threshold_var, width=10).grid(
+            row=1,
+            column=2,
+            sticky="w",
+            padx=(0, 8),
+        )
+
+        ttk.Label(advanced, text="Size bps").grid(row=0, column=3, sticky="w")
+        ttk.Entry(advanced, textvariable=self._trade_requote_size_threshold_var, width=10).grid(
+            row=1,
+            column=3,
+            sticky="w",
+        )
+
+        advanced.columnconfigure(0, weight=1)
+
         options = ttk.Frame(tab)
         options.pack(fill=tk.X, pady=(12, 0))
         ttk.Checkbutton(options, text="Production", variable=self._trade_prod_var).pack(
@@ -479,13 +632,16 @@ class OrderbookViewer(tk.Tk):
             side=tk.LEFT,
             padx=(0, 16),
         )
-        ttk.Checkbutton(options, text="Confirm production money", variable=self._trade_confirm_var).pack(
-            side=tk.LEFT,
-            padx=(0, 16),
-        )
-        ttk.Checkbutton(options, text="Leave orders on stop", variable=self._trade_leave_orders_var).pack(
-            side=tk.LEFT,
-        )
+        ttk.Checkbutton(
+            options,
+            text="Confirm production money",
+            variable=self._trade_confirm_var,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            options,
+            text="Leave orders on stop",
+            variable=self._trade_leave_orders_var,
+        ).pack(side=tk.LEFT)
 
         status_frame = ttk.Frame(tab)
         status_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 8))
@@ -589,8 +745,44 @@ class OrderbookViewer(tk.Tk):
                 self._replay_max_position_var.get(),
                 "Max position",
             )
+            adaptive_params = parse_adaptive_params(self._replay_adaptive_params_var.get())
+            min_requote = _required_nonnegative_float(
+                self._replay_min_requote_var.get(),
+                "Min requote",
+            )
+            min_order_rest = _required_nonnegative_float(
+                self._replay_min_order_rest_var.get(),
+                "Min rest",
+            )
+            requote_price_threshold = _required_nonnegative_price_delta(
+                self._replay_requote_price_threshold_var.get(),
+                "Price threshold",
+            )
+            requote_size_threshold_bps = _required_nonnegative_int(
+                self._replay_requote_size_threshold_var.get(),
+                "Size bps",
+            )
+            optimizer_balance_cents = _optional_dollar_cents(
+                self._replay_optimizer_balance_var.get()
+            )
+            optimize_max_trials = _required_positive_int(
+                self._replay_optimize_max_trials_var.get(),
+                "Max trials",
+            )
         except ValueError as error:
             messagebox.showerror("Invalid backtest setting", str(error))
+            return
+
+        optimize = self._replay_optimize_var.get()
+        optimize_mode = self._replay_optimize_mode_var.get()
+        if optimize and self._replay_strategy_var.get() != "adaptive":
+            messagebox.showerror(
+                "Invalid optimizer setting",
+                "Optimizer requires adaptive strategy.",
+            )
+            return
+        if not optimize and optimize_mode == "all":
+            messagebox.showerror("Invalid optimizer setting", "All mode requires Optimize.")
             return
 
         self._clear_replay_tables()
@@ -610,6 +802,17 @@ class OrderbookViewer(tk.Tk):
                 order_size,
                 max_position,
                 latency_sec,
+                adaptive_params,
+                optimize,
+                optimize_mode,
+                optimizer_balance_cents,
+                optimize_max_trials,
+                _requote_policy(
+                    min_requote_seconds=min_requote,
+                    min_order_rest_seconds=min_order_rest,
+                    price_change_threshold=requote_price_threshold,
+                    size_change_threshold_bps=requote_size_threshold_bps,
+                ),
             ),
             daemon=True,
         )
@@ -639,6 +842,19 @@ class OrderbookViewer(tk.Tk):
                 self._trade_min_requote_var.get(),
                 "Requote seconds",
             )
+            min_order_rest = _required_nonnegative_float(
+                self._trade_min_order_rest_var.get(),
+                "Min rest",
+            )
+            requote_price_threshold = _required_nonnegative_price_delta(
+                self._trade_requote_price_threshold_var.get(),
+                "Price threshold",
+            )
+            requote_size_threshold_bps = _required_nonnegative_int(
+                self._trade_requote_size_threshold_var.get(),
+                "Size bps",
+            )
+            adaptive_params = parse_adaptive_params(self._trade_adaptive_params_var.get())
             duration_sec = _optional_positive_float(self._trade_duration_var.get(), "Duration")
         except ValueError as error:
             messagebox.showerror("Invalid live trading setting", str(error))
@@ -685,6 +901,13 @@ class OrderbookViewer(tk.Tk):
                 duration_sec,
                 client_prefix,
                 min_requote,
+                adaptive_params,
+                _requote_policy(
+                    min_requote_seconds=min_requote,
+                    min_order_rest_seconds=min_order_rest,
+                    price_change_threshold=requote_price_threshold,
+                    size_change_threshold_bps=requote_size_threshold_bps,
+                ),
                 not self._trade_leave_orders_var.get(),
             ),
             daemon=True,
@@ -763,8 +986,18 @@ class OrderbookViewer(tk.Tk):
         for event, payload in _drain_events(self._replay_events):
             if event == "update":
                 self._apply_backtest_update(payload)
+            elif event == "status":
+                self._replay_status_var.set(payload)
             elif event == "result":
                 self._apply_backtest_result(payload)
+            elif event == "optimized":
+                best = payload.best_trial
+                self._replay_adaptive_params_var.set(format_adaptive_params(best.params))
+                self._apply_optimization_settings(best.settings)
+                self._replay_status_var.set(
+                    f"Optimized {len(payload.trials)} trials | "
+                    f"best {payload.objective} | {format_optimization_settings(best.settings)}"
+                )
             elif event == "error":
                 self._replay_status_var.set("Error")
                 self._set_replay_running(False)
@@ -861,6 +1094,15 @@ class OrderbookViewer(tk.Tk):
 
     def _append_result_fills(self, result: BacktestResult) -> None:
         self._append_fill_rows(result.fills)
+
+    def _apply_optimization_settings(self, settings: Any) -> None:
+        policy = settings.requote_policy
+        self._replay_order_size_var.set(format_count_fp(settings.count))
+        self._replay_max_position_var.set(format_count_fp(settings.max_position))
+        self._replay_min_requote_var.set(_format_seconds(policy.min_requote_seconds))
+        self._replay_min_order_rest_var.set(_format_seconds(policy.min_order_rest_seconds))
+        self._replay_requote_price_threshold_var.set(format_price_fp(policy.price_change_threshold))
+        self._replay_requote_size_threshold_var.set(str(policy.size_change_threshold_bps))
 
     def _append_fill_rows(self, fills: Iterable[Any]) -> None:
         for fill in fills:
@@ -1048,14 +1290,47 @@ def _replay_worker_main(
     order_size: int,
     max_position: int,
     latency_sec: float,
+    adaptive_params: dict[str, int],
+    optimize: bool,
+    optimize_mode: str,
+    optimizer_balance_cents: int | None,
+    optimize_max_trials: int,
+    requote_policy: RequotePolicy,
 ) -> None:
     try:
+        fill_model = fill_model_from_name(fill_model_name)
+
+        if optimize:
+            result = asyncio.run(
+                optimize_adaptive_backtest(
+                    recording,
+                    count=order_size,
+                    max_position=max_position,
+                    fill_model_factory=lambda: fill_model_from_name(fill_model_name),
+                    fixed_params=adaptive_params,
+                    optimize_execution=optimize_mode == "all",
+                    speed_multiplier=0.0,
+                    latency_seconds=latency_sec,
+                    requote_policy=requote_policy,
+                    starting_balance_cents=optimizer_balance_cents,
+                    max_trials=optimize_max_trials,
+                    on_progress=lambda trial: events.put(
+                        ("status", format_optimization_trial(trial))
+                    ),
+                    stop_requested=stop_event.is_set,
+                )
+            )
+            events.put(("optimized", result))
+            events.put(("result", result.best_trial.result))
+            events.put(("stopped", None))
+            return
+
         strategy = strategy_from_name(
             strategy_name,
             count=order_size,
             max_position=max_position,
+            adaptive_params=adaptive_params,
         )
-        fill_model = fill_model_from_name(fill_model_name)
 
         def on_update(update: BacktestUpdate) -> None:
             events.put(("update", update))
@@ -1067,6 +1342,7 @@ def _replay_worker_main(
                 fill_model=fill_model,
                 speed_multiplier=speed,
                 latency_seconds=latency_sec,
+                requote_policy=requote_policy,
                 on_update=on_update,
                 update_interval_seconds=refresh,
                 stop_requested=stop_event.is_set,
@@ -1090,6 +1366,8 @@ def _trade_worker_main(
     duration_sec: float | None,
     client_prefix: str,
     min_requote_sec: float,
+    adaptive_params: dict[str, int],
+    requote_policy: RequotePolicy,
     cancel_on_stop: bool,
 ) -> None:
     try:
@@ -1097,6 +1375,7 @@ def _trade_worker_main(
             strategy_name,
             count=order_size,
             max_position=max_position,
+            adaptive_params=adaptive_params,
         )
 
         def on_status(line: str) -> None:
@@ -1111,6 +1390,9 @@ def _trade_worker_main(
                 duration_seconds=duration_sec,
                 client_prefix=client_prefix,
                 min_requote_seconds=min_requote_sec,
+                min_order_rest_seconds=requote_policy.min_order_rest_seconds,
+                requote_price_threshold=requote_policy.price_change_threshold,
+                requote_size_threshold_bps=requote_policy.size_change_threshold_bps,
                 cancel_on_stop=cancel_on_stop,
                 status=on_status,
                 stop_requested=stop_event.is_set,
@@ -1213,6 +1495,33 @@ def _required_nonnegative_float(raw_text: str, label: str) -> float:
     return value
 
 
+def _required_nonnegative_int(raw_text: str, label: str) -> int:
+    value = int(raw_text)
+
+    if value < 0:
+        raise ValueError(f"{label} must be non-negative.")
+
+    return value
+
+
+def _required_positive_int(raw_text: str, label: str) -> int:
+    value = int(raw_text)
+
+    if value <= 0:
+        raise ValueError(f"{label} must be greater than zero.")
+
+    return value
+
+
+def _required_nonnegative_price_delta(raw_text: str, label: str) -> int:
+    value = _parse_price_delta(raw_text)
+
+    if value < 0:
+        raise ValueError(f"{label} must be non-negative.")
+
+    return value
+
+
 def _required_positive_count(raw_text: str, label: str) -> int:
     count = parse_count_fp(raw_text)
 
@@ -1238,6 +1547,49 @@ def _optional_positive_float(raw_text: str, label: str) -> float | None:
         return None
 
     return _required_positive_float(text, label)
+
+
+def _requote_policy(
+    *,
+    min_requote_seconds: float,
+    min_order_rest_seconds: float,
+    price_change_threshold: int,
+    size_change_threshold_bps: int,
+) -> RequotePolicy:
+    return RequotePolicy(
+        min_requote_seconds=min_requote_seconds,
+        min_order_rest_seconds=min_order_rest_seconds,
+        price_change_threshold=price_change_threshold,
+        size_change_threshold_bps=size_change_threshold_bps,
+    )
+
+
+def _parse_price_delta(raw_text: str) -> int:
+    text = raw_text.strip()
+
+    if "." in text:
+        return parse_price_fp(text)
+
+    return int(text)
+
+
+def _optional_dollar_cents(raw_text: str) -> int | None:
+    text = raw_text.strip()
+
+    if not text:
+        return None
+
+    cents = int((Decimal(text) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+    if cents <= 0:
+        raise ValueError("Balance must be greater than zero.")
+
+    return cents
+
+
+def _format_seconds(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _trade_result_status(stats: LiveRunStats) -> str:

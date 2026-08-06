@@ -86,13 +86,13 @@ def test_live_order_manager_dry_run_replaces_changed_quotes() -> None:
     asyncio.run(run())
 
 
-def test_live_order_manager_rate_limits_replacement_create_not_stale_cancel() -> None:
+def test_live_order_manager_rate_limits_replacement_without_canceling_resting_quote() -> None:
     async def run() -> None:
         manager = LiveOrderManager(FakeRest(), dry_run=True, min_requote_seconds=10)
 
         assert await manager.sync_quotes("M1", [buy_intent()], now=1) == (1, 0)
-        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=2) == (0, 1)
-        assert manager.orders == {}
+        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=2) == (0, 0)
+        assert [order.yes_price for order in manager.orders.values()] == [parse_price_fp("0.5000")]
 
     asyncio.run(run())
 
@@ -113,8 +113,85 @@ def test_live_order_manager_creates_replacement_after_requote_interval() -> None
         manager = LiveOrderManager(FakeRest(), dry_run=True, min_requote_seconds=10)
 
         assert await manager.sync_quotes("M1", [buy_intent()], now=1) == (1, 0)
-        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=2) == (0, 1)
-        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=11) == (1, 0)
+        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=2) == (0, 0)
+        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=11) == (1, 1)
+
+    asyncio.run(run())
+
+
+def test_live_order_manager_keeps_small_quote_changes_below_threshold() -> None:
+    async def run() -> None:
+        manager = LiveOrderManager(
+            FakeRest(),
+            dry_run=True,
+            requote_price_threshold=parse_price_fp("0.0200"),
+            requote_size_threshold_bps=5_000,
+        )
+
+        assert await manager.sync_quotes("M1", [buy_intent()], now=1) == (1, 0)
+        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=2) == (0, 0)
+        assert [order.yes_price for order in manager.orders.values()] == [parse_price_fp("0.5000")]
+
+    asyncio.run(run())
+
+
+def test_live_order_manager_replaces_material_quote_changes() -> None:
+    async def run() -> None:
+        manager = LiveOrderManager(
+            FakeRest(),
+            dry_run=True,
+            requote_price_threshold=parse_price_fp("0.0200"),
+            requote_size_threshold_bps=5_000,
+        )
+
+        assert await manager.sync_quotes("M1", [buy_intent()], now=1) == (1, 0)
+        assert await manager.sync_quotes("M1", [buy_intent("0.4800")], now=2) == (1, 1)
+        assert [order.yes_price for order in manager.orders.values()] == [parse_price_fp("0.4800")]
+
+    asyncio.run(run())
+
+
+def test_live_order_manager_keeps_small_size_changes_with_zero_price_threshold() -> None:
+    async def run() -> None:
+        manager = LiveOrderManager(
+            FakeRest(),
+            dry_run=True,
+            requote_size_threshold_bps=5_000,
+        )
+
+        assert await manager.sync_quotes("M1", [buy_intent(count=COUNT_SCALE)], now=1) == (1, 0)
+        assert await manager.sync_quotes("M1", [buy_intent(count=90)], now=2) == (0, 0)
+        assert [order.remaining_count for order in manager.orders.values()] == [COUNT_SCALE]
+
+    asyncio.run(run())
+
+
+def test_live_order_manager_respects_minimum_order_rest_time() -> None:
+    async def run() -> None:
+        manager = LiveOrderManager(
+            FakeRest(),
+            dry_run=True,
+            min_order_rest_seconds=5.0,
+        )
+
+        assert await manager.sync_quotes("M1", [buy_intent()], now=1) == (1, 0)
+        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=2) == (0, 0)
+        assert await manager.sync_quotes("M1", [buy_intent("0.4900")], now=6) == (1, 1)
+
+    asyncio.run(run())
+
+
+def test_live_order_manager_bypasses_minimum_rest_for_large_price_moves() -> None:
+    async def run() -> None:
+        manager = LiveOrderManager(
+            FakeRest(),
+            dry_run=True,
+            min_order_rest_seconds=5.0,
+            requote_price_threshold=parse_price_fp("0.0200"),
+        )
+
+        assert await manager.sync_quotes("M1", [buy_intent()], now=1) == (1, 0)
+        assert await manager.sync_quotes("M1", [buy_intent("0.4600")], now=2) == (1, 1)
 
     asyncio.run(run())
 

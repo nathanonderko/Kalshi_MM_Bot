@@ -13,9 +13,11 @@ from kalshi_mm_bot.sim import (
     QueueAwareFillModel,
     SimPortfolio,
     SimulatedOrderManager,
+    optimize_adaptive_backtest,
     run_replay_backtest,
 )
 from kalshi_mm_bot.strategy import DumbMarketMakerStrategy
+from kalshi_mm_bot.strategy.requote import RequotePolicy
 from kalshi_mm_bot.strategy.types import QuoteIntent, StrategyContext
 
 
@@ -67,13 +69,13 @@ def make_book() -> Orderbook:
     )
 
 
-def buy_intent(count: int = COUNT_SCALE) -> QuoteIntent:
+def buy_intent(price: str = "0.5000", count: int = COUNT_SCALE) -> QuoteIntent:
     return QuoteIntent(
         quote_id="M1:yes:buy",
         market_ticker="M1",
         action="buy",
         side="yes",
-        yes_price=parse_price_fp("0.5000"),
+        yes_price=parse_price_fp(price),
         count=count,
     )
 
@@ -203,6 +205,47 @@ def test_simulated_order_manager_rejects_duplicate_quote_ids() -> None:
     assert manager.orders == {}
 
 
+def test_simulated_order_manager_keeps_changed_quote_inside_requote_interval() -> None:
+    book = make_book()
+    manager = SimulatedOrderManager(
+        fill_model=OptimisticFillModel(),
+        portfolio=SimPortfolio(),
+        requote_policy=RequotePolicy(min_requote_seconds=10),
+    )
+
+    manager.sync_market_quotes(
+        "M1",
+        [buy_intent()],
+        {"M1": book},
+        StrategyContext(event_count=1, offset_seconds=1),
+    )
+    manager.sync_market_quotes(
+        "M1",
+        [buy_intent("0.4900")],
+        {"M1": book},
+        StrategyContext(event_count=2, offset_seconds=2),
+    )
+
+    assert [order.yes_price for order in manager.orders.values()] == [parse_price_fp("0.5000")]
+
+
+def test_simulated_order_manager_skips_orders_over_balance() -> None:
+    manager = SimulatedOrderManager(
+        fill_model=OptimisticFillModel(),
+        portfolio=SimPortfolio(),
+        starting_balance_cents=0,
+    )
+
+    order = manager.place_order(
+        buy_intent(),
+        {"M1": make_book()},
+        StrategyContext(event_count=1, offset_seconds=0),
+    )
+
+    assert order is None
+    assert manager.skipped_order_count == 1
+
+
 def test_replay_backtest_runs_strategy_against_recording(tmp_path) -> None:
     recording_dir = tmp_path / "session"
 
@@ -232,5 +275,52 @@ def test_replay_backtest_runs_strategy_against_recording(tmp_path) -> None:
         assert result.summary.fill_count == 1
         assert result.summary.buy_filled_count == COUNT_SCALE
         assert result.summary.position_count == COUNT_SCALE
+
+    asyncio.run(run())
+
+
+def test_optimizer_searches_execution_settings_with_balance(tmp_path) -> None:
+    recording_dir = tmp_path / "session"
+
+    with RecordingSessionWriter.create(recording_dir) as writer:
+        writer.write_event(subscribed())
+        writer.write_event(snapshot(1))
+        writer.write_event(delta(2, "yes", "0.5000", "-1.00"))
+        writer.write_manifest(
+            RecordingManifest.create(
+                environment="demo",
+                tickers=("M1",),
+                channels=(ORDERBOOK_CHANNEL,),
+                price_ranges_by_ticker=PRICE_RANGES,
+                event_file=writer.event_path.name,
+                started_at_utc=writer.started_at_utc,
+            )
+        )
+
+    async def run() -> None:
+        result = await optimize_adaptive_backtest(
+            recording_dir,
+            count=COUNT_SCALE,
+            max_position=COUNT_SCALE,
+            fill_model_factory=OptimisticFillModel,
+            search_space={"min_profit_edge": (25,)},
+            execution_search_space={
+                "order_size": (parse_count_fp("0.50"), COUNT_SCALE),
+                "max_position": (COUNT_SCALE,),
+                "min_requote_sec": (0.0,),
+                "min_order_rest_sec": (0.0,),
+                "requote_price_threshold": (0,),
+                "requote_size_threshold_bps": (0,),
+            },
+            optimize_execution=True,
+            starting_balance_cents=100,
+            max_trials=None,
+        )
+
+        assert len(result.trials) == 2
+        assert {trial.settings.count for trial in result.trials} == {
+            parse_count_fp("0.50"),
+            COUNT_SCALE,
+        }
 
     asyncio.run(run())

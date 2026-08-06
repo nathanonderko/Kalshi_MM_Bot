@@ -7,12 +7,22 @@ from pathlib import Path
 
 from kalshi_mm_bot.api.feed_controller import FeedController, ORDERBOOK_CHANNEL
 from kalshi_mm_bot.market.orderbook import Orderbook
+from kalshi_mm_bot.market.price import COUNT_SCALE, ONE_DOLLAR, PRICE_SCALE
 from kalshi_mm_bot.market.view import TopOfBookRow, top_of_book_rows
-from kalshi_mm_bot.recording import RecordedRestClient, RecordedWebSocketClient, RecordingSessionReader
+from kalshi_mm_bot.recording import (
+    RecordedRestClient,
+    RecordedWebSocketClient,
+    RecordingSessionReader,
+)
 from kalshi_mm_bot.sim.accounting import SimPortfolio
 from kalshi_mm_bot.sim.fills import FillModel, SimulatedFill
 from kalshi_mm_bot.sim.orders import SimulatedOrder
 from kalshi_mm_bot.strategy.quotes import quote_intent_map
+from kalshi_mm_bot.strategy.requote import (
+    RequotePolicy,
+    quote_matches,
+    should_replace_quote,
+)
 from kalshi_mm_bot.strategy.types import QuoteIntent, Strategy, StrategyContext
 
 
@@ -30,6 +40,9 @@ class BacktestSummary:
     volume_count: int
     cash_value: int
     mark_to_market_value: int
+    starting_balance_cents: int | None = None
+    reserved_risk_cents: int = 0
+    skipped_order_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +76,8 @@ class SimulatedOrderManager:
         fill_model: FillModel,
         portfolio: SimPortfolio,
         latency_seconds: float = 0.0,
+        requote_policy: RequotePolicy | None = None,
+        starting_balance_cents: int | None = None,
     ) -> None:
         if latency_seconds < 0:
             raise ValueError("latency_seconds must be non-negative")
@@ -70,11 +85,15 @@ class SimulatedOrderManager:
         self.fill_model = fill_model
         self.portfolio = portfolio
         self.latency_seconds = latency_seconds
+        self.requote_policy = requote_policy or RequotePolicy()
+        self.starting_balance_cents = starting_balance_cents
         self.orders: dict[str, SimulatedOrder] = {}
         self.fills: list[SimulatedFill] = []
         self.event_count = 0
+        self.skipped_order_count = 0
 
         self._next_order_number = 1
+        self._last_sync_by_ticker: dict[str, float] = {}
 
     def process_market_event(
         self,
@@ -124,6 +143,12 @@ class SimulatedOrderManager:
     ) -> None:
         wanted = quote_intent_map(intents)
         self._settle_due_orders(orderbooks, context)
+        last_sync = self._last_sync_by_ticker.get(market_ticker)
+        can_place = (
+            last_sync is None
+            or context.offset_seconds - last_sync >= self.requote_policy.min_requote_seconds
+        )
+        replacements: list[SimulatedOrder] = []
 
         for order in tuple(self.orders.values()):
             if order.market_ticker != market_ticker or not _is_live_order(order):
@@ -131,14 +156,37 @@ class SimulatedOrderManager:
 
             intent = wanted.get(order.quote_id)
 
-            if intent is None or not _matches_intent(order, intent):
+            if intent is None:
                 self.cancel_order(order, context)
+                continue
+
+            if should_replace_quote(
+                order,
+                intent,
+                policy=self.requote_policy,
+                now=context.offset_seconds,
+                created_at=order.created_offset_seconds,
+            ):
+                replacements.append(order)
+
+        if can_place:
+            for order in replacements:
+                self.cancel_order(order, context)
+
+        if not can_place:
+            return
+
+        placed = False
 
         for intent in wanted.values():
             if self._has_matching_live_order(intent):
                 continue
 
-            self.place_order(intent, orderbooks, context)
+            if self.place_order(intent, orderbooks, context) is not None:
+                placed = True
+
+        if placed:
+            self._last_sync_by_ticker[market_ticker] = context.offset_seconds
 
     def place_order(
         self,
@@ -149,6 +197,10 @@ class SimulatedOrderManager:
         book = orderbooks.get(intent.market_ticker)
 
         if book is None:
+            return None
+
+        if self._exceeds_balance(intent):
+            self.skipped_order_count += 1
             return None
 
         order = SimulatedOrder.from_intent(
@@ -229,6 +281,29 @@ class SimulatedOrderManager:
         self._next_order_number += 1
         return order_id
 
+    def reserved_risk_cents(self) -> int:
+        return sum(
+            _estimated_required_cents(order)
+            for order in self.orders.values()
+            if _is_live_order(order)
+        )
+
+    def _exceeds_balance(self, intent: QuoteIntent) -> bool:
+        if self.starting_balance_cents is None:
+            return False
+
+        return (
+            self.reserved_risk_cents() + _estimated_required_cents(intent)
+            > self._available_balance_cents()
+        )
+
+    def _available_balance_cents(self) -> int:
+        if self.starting_balance_cents is None:
+            return 0
+
+        cash_cents = self.portfolio.total_cash() * 100 // (PRICE_SCALE * COUNT_SCALE)
+        return max(0, self.starting_balance_cents + cash_cents)
+
 
 async def run_replay_backtest(
     recording: str | Path,
@@ -237,6 +312,8 @@ async def run_replay_backtest(
     fill_model: FillModel,
     speed_multiplier: float = 0.0,
     latency_seconds: float = 0.0,
+    requote_policy: RequotePolicy | None = None,
+    starting_balance_cents: int | None = None,
     on_update: UpdateCallback | None = None,
     update_interval_seconds: float = 0.25,
     stop_requested: StopRequested | None = None,
@@ -254,6 +331,8 @@ async def run_replay_backtest(
         fill_model=fill_model,
         portfolio=portfolio,
         latency_seconds=latency_seconds,
+        requote_policy=requote_policy,
+        starting_balance_cents=starting_balance_cents,
     )
     last_update_monotonic = 0.0
     result: BacktestResult | None = None
@@ -390,6 +469,9 @@ def _build_summary(
         volume_count=manager.portfolio.total_volume_count(),
         cash_value=manager.portfolio.total_cash(),
         mark_to_market_value=manager.portfolio.mark_to_market(controller.orderbooks),
+        starting_balance_cents=manager.starting_balance_cents,
+        reserved_risk_cents=manager.reserved_risk_cents(),
+        skipped_order_count=manager.skipped_order_count,
     )
 
 
@@ -398,11 +480,14 @@ def _is_live_order(order: SimulatedOrder) -> bool:
 
 
 def _matches_intent(order: SimulatedOrder, intent: QuoteIntent) -> bool:
-    return (
-        order.quote_id == intent.quote_id
-        and order.market_ticker == intent.market_ticker
-        and order.action == intent.action
-        and order.side == intent.side
-        and order.yes_price == intent.yes_price
-        and order.remaining_count == intent.count
-    )
+    return quote_matches(order, intent)
+
+
+def _estimated_required_cents(intent: QuoteIntent | SimulatedOrder) -> int:
+    risk_price = intent.yes_price if intent.action == "buy" else ONE_DOLLAR - intent.yes_price
+    count = intent.remaining_count if isinstance(intent, SimulatedOrder) else intent.count
+    return _ceil_div(risk_price * count * 100, PRICE_SCALE * COUNT_SCALE)
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return -(-numerator // denominator)

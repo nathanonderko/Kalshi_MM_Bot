@@ -38,6 +38,7 @@ from kalshi_mm_bot.market.types import (
     order_book_side,
 )
 from kalshi_mm_bot.strategy.quotes import quote_intent_map
+from kalshi_mm_bot.strategy.requote import RequotePolicy, quote_matches, should_replace_quote
 from kalshi_mm_bot.strategy.types import QuoteIntent, Strategy, StrategyContext
 
 StatusCallback = Callable[[str], None]
@@ -84,6 +85,7 @@ class LiveOrder:
     side: OutcomeSide
     yes_price: int
     remaining_count: int
+    created_monotonic: float
 
     @classmethod
     def from_intent(
@@ -92,6 +94,7 @@ class LiveOrder:
         order_id: str,
         client_order_id: str,
         intent: QuoteIntent,
+        created_monotonic: float,
         remaining_count: int | None = None,
     ) -> "LiveOrder":
         return cls(
@@ -103,17 +106,11 @@ class LiveOrder:
             side=intent.side,
             yes_price=intent.yes_price,
             remaining_count=intent.count if remaining_count is None else remaining_count,
+            created_monotonic=created_monotonic,
         )
 
     def matches(self, intent: QuoteIntent) -> bool:
-        return (
-            self.quote_id == intent.quote_id
-            and self.market_ticker == intent.market_ticker
-            and self.action == intent.action
-            and self.side == intent.side
-            and self.yes_price == intent.yes_price
-            and self.remaining_count == intent.count
-        )
+        return quote_matches(self, intent)
 
 
 @dataclass(slots=True)
@@ -134,12 +131,12 @@ class LiveOrderManager:
         dry_run: bool = True,
         client_prefix: str = "kmm",
         min_requote_seconds: float = 0.0,
+        min_order_rest_seconds: float = 0.0,
+        requote_price_threshold: int = 0,
+        requote_size_threshold_bps: int = 0,
         rejection_cooldown_seconds: float = 1.0,
         status: StatusCallback | None = None,
     ) -> None:
-        if min_requote_seconds < 0:
-            raise ValueError("min_requote_seconds must be non-negative")
-
         if rejection_cooldown_seconds < 0:
             raise ValueError("rejection_cooldown_seconds must be non-negative")
 
@@ -151,7 +148,12 @@ class LiveOrderManager:
         self.rest = rest
         self.dry_run = dry_run
         self.client_prefix = normalized_prefix
-        self.min_requote_seconds = min_requote_seconds
+        self.requote_policy = RequotePolicy(
+            min_requote_seconds=min_requote_seconds,
+            min_order_rest_seconds=min_order_rest_seconds,
+            price_change_threshold=requote_price_threshold,
+            size_change_threshold_bps=requote_size_threshold_bps,
+        )
         self.rejection_cooldown_seconds = rejection_cooldown_seconds
         self.status = status
         self.orders: dict[str, LiveOrder] = {}
@@ -198,10 +200,11 @@ class LiveOrderManager:
         last_sync = self._last_sync_by_ticker.get(market_ticker)
         can_create = (
             last_sync is None
-            or now - last_sync >= self.min_requote_seconds
+            or now - last_sync >= self.requote_policy.min_requote_seconds
         )
         created = 0
         canceled = 0
+        replacements: list[LiveOrder] = []
 
         for order in tuple(self.orders.values()):
             if order.market_ticker != market_ticker:
@@ -209,7 +212,22 @@ class LiveOrderManager:
 
             intent = wanted.get(order.quote_id)
 
-            if intent is None or not order.matches(intent):
+            if intent is None:
+                await self._cancel(order)
+                canceled += 1
+                continue
+
+            if should_replace_quote(
+                order,
+                intent,
+                policy=self.requote_policy,
+                now=now,
+                created_at=order.created_monotonic,
+            ):
+                replacements.append(order)
+
+        if can_create:
+            for order in replacements:
                 await self._cancel(order)
                 canceled += 1
 
@@ -308,6 +326,7 @@ class LiveOrderManager:
                     order_id=f"dry-{client_order_id}",
                     client_order_id=client_order_id,
                     intent=intent,
+                    created_monotonic=now,
                 )
                 self._emit(
                     f"DRY create {intent.market_ticker} {intent.action} "
@@ -374,6 +393,7 @@ class LiveOrderManager:
                 order_id=order_id,
                 client_order_id=client_order_id,
                 intent=intent,
+                created_monotonic=now,
                 remaining_count=remaining_count,
             )
             created += 1
@@ -426,6 +446,9 @@ async def run_live_strategy(
     duration_seconds: float | None = None,
     client_prefix: str = "kmm",
     min_requote_seconds: float = 0.0,
+    min_order_rest_seconds: float = 0.0,
+    requote_price_threshold: int = 0,
+    requote_size_threshold_bps: int = 0,
     cancel_on_stop: bool = True,
     status: StatusCallback | None = None,
     stop_requested: StopRequested | None = None,
@@ -446,6 +469,9 @@ async def run_live_strategy(
         dry_run=dry_run,
         client_prefix=client_prefix,
         min_requote_seconds=min_requote_seconds,
+        min_order_rest_seconds=min_order_rest_seconds,
+        requote_price_threshold=requote_price_threshold,
+        requote_size_threshold_bps=requote_size_threshold_bps,
         status=status,
     )
     stats = LiveRunStats(dry_run=dry_run)

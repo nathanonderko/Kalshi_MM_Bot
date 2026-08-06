@@ -2,14 +2,44 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from kalshi_mm_bot.market.orderbook import Orderbook
-from kalshi_mm_bot.market.price import COUNT_SCALE, ONE_DOLLAR
+from kalshi_mm_bot.market.price import (
+    COUNT_SCALE,
+    ONE_DOLLAR,
+    format_count_fp,
+    format_price_fp,
+    parse_count_fp,
+    parse_price_fp,
+)
 from kalshi_mm_bot.market.types import MarketTicker, OrderAction
 from kalshi_mm_bot.strategy.types import PortfolioView, QuoteIntent, StrategyContext
 
 BPS_SCALE = 10_000
+
+_COUNT_PARAMS = frozenset({"count", "max_position", "min_count", "min_top_size"})
+_PRICE_PARAMS = frozenset(
+    {
+        "min_profit_edge",
+        "max_spread",
+        "max_quote_away",
+        "inventory_skew",
+        "adverse_move_threshold",
+    }
+)
+_BPS_PARAMS = frozenset(
+    {
+        "fee_rate_bps",
+        "inventory_size_penalty_bps",
+        "liquidity_fraction_bps",
+    }
+)
+_INT_PARAMS = frozenset({"trend_lookback"})
+ADAPTIVE_PARAMETER_NAMES = tuple(
+    sorted(_COUNT_PARAMS | _PRICE_PARAMS | _BPS_PARAMS | _INT_PARAMS)
+)
 
 
 @dataclass(slots=True)
@@ -172,6 +202,98 @@ class AdaptivePredictionMarketMakerStrategy:
         count = min(desired, capacity)
 
         return count if count >= min_count else 0
+
+
+def parse_adaptive_params(raw_values: str | Iterable[str] | None) -> dict[str, int]:
+    """Parse adaptive strategy overrides from key=value strings."""
+
+    params: dict[str, int] = {}
+
+    for entry in _param_entries(raw_values):
+        name, separator, raw_value = entry.partition("=")
+
+        if not separator:
+            raise ValueError(f"invalid adaptive parameter {entry!r}; expected key=value")
+
+        name = name.strip()
+
+        if name not in ADAPTIVE_PARAMETER_NAMES:
+            valid = ", ".join(ADAPTIVE_PARAMETER_NAMES)
+            raise ValueError(f"unknown adaptive parameter {name!r}; valid names: {valid}")
+
+        params[name] = _parse_adaptive_value(name, raw_value.strip())
+
+    return params
+
+
+def format_adaptive_params(params: Mapping[str, int]) -> str:
+    return ", ".join(
+        f"{name}={_format_adaptive_value(name, value)}"
+        for name, value in sorted(params.items())
+    )
+
+
+def adaptive_param_help() -> str:
+    return (
+        "Adaptive overrides as key=value, comma separated or repeated. "
+        "Count fields use contracts, price fields use decimals like 0.0200 or raw ticks. "
+        f"Valid names: {', '.join(ADAPTIVE_PARAMETER_NAMES)}."
+    )
+
+
+def _param_entries(raw_values: str | Iterable[str] | None) -> Iterable[str]:
+    if raw_values is None:
+        return ()
+
+    values = (raw_values,) if isinstance(raw_values, str) else raw_values
+    entries: list[str] = []
+
+    for raw_text in values:
+        for entry in raw_text.replace(";", ",").split(","):
+            entry = entry.strip()
+
+            if entry:
+                entries.append(entry)
+
+    return tuple(entries)
+
+
+def _parse_adaptive_value(name: str, raw_value: str) -> int:
+    if not raw_value:
+        raise ValueError(f"empty value for adaptive parameter {name!r}")
+
+    if name in _COUNT_PARAMS:
+        return parse_count_fp(raw_value)
+
+    if name in _PRICE_PARAMS:
+        return _parse_price_ticks(raw_value)
+
+    value = int(raw_value)
+
+    if name in _BPS_PARAMS and value < 0:
+        raise ValueError(f"{name} must be non-negative")
+
+    if name in _INT_PARAMS and value <= 1:
+        raise ValueError(f"{name} must be greater than one")
+
+    return value
+
+
+def _format_adaptive_value(name: str, value: int) -> str:
+    if name in _COUNT_PARAMS:
+        return format_count_fp(value)
+
+    if name in _PRICE_PARAMS:
+        return format_price_fp(value)
+
+    return str(value)
+
+
+def _parse_price_ticks(raw_value: str) -> int:
+    if "." in raw_value:
+        return parse_price_fp(raw_value)
+
+    return int(raw_value)
 
 
 def _quote(

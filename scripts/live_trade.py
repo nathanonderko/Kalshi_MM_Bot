@@ -11,9 +11,14 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kalshi_mm_bot.live import run_live_strategy
-from kalshi_mm_bot.market.price import parse_count_fp
+from kalshi_mm_bot.market.price import parse_count_fp, parse_price_fp
 from kalshi_mm_bot.market.tickers import parse_ticker_tuple
-from kalshi_mm_bot.strategy import STRATEGY_NAMES, strategy_from_name
+from kalshi_mm_bot.strategy import (
+    STRATEGY_NAMES,
+    adaptive_param_help,
+    parse_adaptive_params,
+    strategy_from_name,
+)
 
 
 def main() -> None:
@@ -37,10 +42,12 @@ def main() -> None:
 
 
 async def _run(args: argparse.Namespace):
+    adaptive_params = parse_adaptive_params(args.adaptive_param)
     strategy = strategy_from_name(
         args.strategy,
         count=parse_count_fp(args.order_size),
         max_position=parse_count_fp(args.max_position),
+        adaptive_params=adaptive_params,
     )
 
     return await run_live_strategy(
@@ -51,6 +58,9 @@ async def _run(args: argparse.Namespace):
         duration_seconds=args.duration_sec,
         client_prefix=args.client_prefix,
         min_requote_seconds=args.min_requote_sec,
+        min_order_rest_seconds=args.min_order_rest_sec,
+        requote_price_threshold=args.requote_price_threshold,
+        requote_size_threshold_bps=args.requote_size_threshold_bps,
         cancel_on_stop=not args.leave_orders,
         status=print,
     )
@@ -76,6 +86,13 @@ def _parse_args() -> argparse.Namespace:
         help="Absolute YES inventory cap. Default: 10.00.",
     )
     parser.add_argument(
+        "--adaptive-param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=adaptive_param_help(),
+    )
+    parser.add_argument(
         "--duration-sec",
         type=float,
         help="Stop automatically after this many seconds.",
@@ -85,6 +102,23 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Minimum seconds between replacement creates per market. Default: 0.25.",
+    )
+    parser.add_argument(
+        "--min-order-rest-sec",
+        type=float,
+        default=0.50,
+        help="Minimum seconds to keep a changed quote resting before replacement. Default: 0.50.",
+    )
+    parser.add_argument(
+        "--requote-price-threshold",
+        default="0.0200",
+        help="Replace only when target price moves by at least this much. Default: 0.0200.",
+    )
+    parser.add_argument(
+        "--requote-size-threshold-bps",
+        type=int,
+        default=5_000,
+        help="Replace only when target size changes by this many bps. Default: 5000.",
     )
     parser.add_argument(
         "--client-prefix",
@@ -134,7 +168,20 @@ def _parse_args() -> argparse.Namespace:
     if args.min_requote_sec < 0:
         parser.error("--min-requote-sec must be non-negative")
 
+    if args.min_order_rest_sec < 0:
+        parser.error("--min-order-rest-sec must be non-negative")
+
+    if args.requote_size_threshold_bps < 0:
+        parser.error("--requote-size-threshold-bps must be non-negative")
+
     try:
+        args.requote_price_threshold = _parse_price_delta(args.requote_price_threshold)
+
+        if args.requote_price_threshold < 0:
+            parser.error("--requote-price-threshold must be non-negative")
+
+        parse_adaptive_params(args.adaptive_param)
+
         if parse_count_fp(args.order_size) <= 0:
             parser.error("--order-size must be greater than zero")
 
@@ -147,6 +194,15 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--prod --execute requires --confirm-real-money")
 
     return args
+
+
+def _parse_price_delta(raw_text: str) -> int:
+    text = raw_text.strip()
+
+    if "." in text:
+        return parse_price_fp(text)
+
+    return int(text)
 
 
 if __name__ == "__main__":
